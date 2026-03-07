@@ -1,5 +1,14 @@
-torch>=2.0.0
-torchvision>=0.15.0
+# PyTorch with CUDA support (for CUDA 12.x)
+# Install PyTorch with CUDA using:
+# pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+# Or for CUDA 12.4:
+# pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
+# 
+# For CPU-only version (not recommended if you have a GPU):
+# torch>=2.0.0
+# torchvision>=0.15.0
+
+# After installing PyTorch with CUDA, install the rest:
 transformers>=4.30.0
 Pillow>=9.0.0
 numpy>=1.24.0

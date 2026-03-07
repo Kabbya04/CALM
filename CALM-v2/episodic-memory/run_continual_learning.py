@@ -20,6 +20,20 @@ from ensemble_calibration import EnsembleCLIPModels
 
 # --- 1. Setup & Helper Functions ---
 
+def clear_gpu_cache(device):
+    """Clear GPU cache to prevent memory buildup."""
+    if device == "cuda" and torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+
+def get_gpu_memory_info(device):
+    """Get current GPU memory usage information."""
+    if device == "cuda" and torch.cuda.is_available():
+        allocated = torch.cuda.memory_allocated(0) / 1024**3  # GB
+        reserved = torch.cuda.memory_reserved(0) / 1024**3  # GB
+        return f"GPU Memory: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved"
+    return ""
+
 def get_best_device():
     """
     Automatically detect and return the best available device.
@@ -67,11 +81,14 @@ def parse_args():
     parser.add_argument('--temperature', type=float, default=1.0,
                         help='Temperature for softmax confidence calibration.')
     
+    parser.add_argument('--batch_size', type=int, default=32,
+                        help='Batch size for data loading. Reduce if experiencing GPU memory issues. Default: 32')
+    
     return parser.parse_args()
 
 # --- 2. Evaluation Logic Functions ---
 
-def evaluate_zero_shot_continual(ensemble_models, data_manager, device):
+def evaluate_zero_shot_continual(ensemble_models, data_manager, device, batch_size=32):
     """Evaluates Zero-Shot performance across all sequential tasks using ensemble."""
     ensemble_models.models[list(ensemble_models.models.keys())[0]].eval()
     task_accuracies = []
@@ -86,7 +103,7 @@ def evaluate_zero_shot_continual(ensemble_models, data_manager, device):
     text_inputs = processor(text=text_prompts, return_tensors="pt", padding=True).to(device)
 
     for task_id in range(data_manager.num_tasks):
-        test_loader = DataLoader(data_manager.get_task_datasets('test', task_id), batch_size=128)
+        test_loader = DataLoader(data_manager.get_task_datasets('test', task_id), batch_size=batch_size)
         
         correct = 0
         total = 0
@@ -108,16 +125,21 @@ def evaluate_zero_shot_continual(ensemble_models, data_manager, device):
                 
                 correct += (preds_global == labels.to(device)).sum().item()
                 total += len(labels)
+                
+                # Clear GPU cache periodically to prevent memory buildup
+                if total % (batch_size * 10) == 0:
+                    clear_gpu_cache(device)
         
         task_acc = (correct / total) * 100 if total > 0 else 0
         task_accuracies.append(task_acc)
         print(f"  Zero-Shot Accuracy on Task {task_id+1}: {task_acc:.2f}%")
+        clear_gpu_cache(device)  # Clear after each task
         
     return np.mean(task_accuracies)
 
 def run_continual_task_sequence(ensemble_models, data_manager, k_shot, device, 
                                 delta_low=0.55, delta_high=0.85, temperature=1.0,
-                                train_compression=False, compression_epochs=50):
+                                train_compression=False, compression_epochs=50, batch_size=32):
     """
     Runs a full continual learning sequence with enhanced memory and ensemble calibration.
     """
@@ -197,9 +219,9 @@ def run_continual_task_sequence(ensemble_models, data_manager, k_shot, device,
         
         # Evaluate on all seen tasks
         for j in range(task_id + 1):
-            test_loader = DataLoader(data_manager.get_task_datasets('test', j), batch_size=128)
+            test_loader = DataLoader(data_manager.get_task_datasets('test', j), batch_size=batch_size)
             acc, stats = evaluate_on_memory_ensemble(memory, ensemble_models, test_loader, device,
-                                                     delta_low, delta_high, temperature)
+                                                     delta_low, delta_high, temperature, batch_size)
             results_matrix[task_id, j] = acc
             
             # Update statistics
@@ -208,6 +230,9 @@ def run_continual_task_sequence(ensemble_models, data_manager, k_shot, device,
                     tier_counts[tier] += stats['tier_counts'][tier]
                 human_feedback_count += stats.get('human_feedback', 0)
                 total_predictions += stats.get('total_predictions', 0)
+            
+            # Clear GPU cache after each evaluation
+            clear_gpu_cache(device)
     
     # Calculate metrics
     avg_accuracy = results_matrix.diagonal().mean()
@@ -230,7 +255,7 @@ def run_continual_task_sequence(ensemble_models, data_manager, k_shot, device,
     }
 
 def evaluate_on_memory_ensemble(memory, ensemble_models, test_loader, device,
-                                delta_low=0.55, delta_high=0.85, temperature=1.0):
+                                delta_low=0.55, delta_high=0.85, temperature=1.0, batch_size=32):
     """
     Evaluate using ensemble models and hierarchical memory with tiered decision making.
     """
@@ -285,8 +310,13 @@ def evaluate_on_memory_ensemble(memory, ensemble_models, test_loader, device,
                 # In real deployment, only high/medium_autonomous would be deployed
                 if pred_class == true_label.item():
                     correct += 1
+            
+            # Clear GPU cache periodically during evaluation
+            if total % (batch_size * 5) == 0:
+                clear_gpu_cache(device)
     
     accuracy = (correct / total * 100) if total > 0 else 0.0
+    clear_gpu_cache(device)  # Final cleanup
     
     stats = {
         'tier_counts': tier_counts,
@@ -309,6 +339,9 @@ if __name__ == "__main__":
     print(f"Dataset: {args.dataset.upper()}")
     print(f"Temperature: {args.temperature}")
     print(f"Confidence Thresholds: δ_low={args.delta_low}, δ_high={args.delta_high}")
+    print(f"Batch Size: {args.batch_size}")
+    if device == "cuda":
+        print(f"⚠ GPU Memory Warning: Using batch_size={args.batch_size}. If you experience display shutdowns, try reducing batch_size (e.g., --batch_size 16)")
     print(f"{'='*70}\n")
     
     # Initialize dataset manager
@@ -318,18 +351,24 @@ if __name__ == "__main__":
     print("\n--- Initializing Ensemble CLIP Models ---")
     ensemble_models = EnsembleCLIPModels(device=device)
     
+    # Clear GPU cache after model loading
+    clear_gpu_cache(device)
+    if device == "cuda":
+        print(get_gpu_memory_info(device))
+    
     print(f"\n{'='*70}\nStarting Continual Learning Experiment\n{'='*70}")
     
     # Phase 1: Zero-shot baseline
     print("\n--- Phase 1: Evaluating Zero-Shot Baseline ---")
-    zero_shot_avg_acc = evaluate_zero_shot_continual(ensemble_models, data_manager, device)
+    zero_shot_avg_acc = evaluate_zero_shot_continual(ensemble_models, data_manager, device, batch_size=args.batch_size)
     
     # Phase 2: 1-shot with enhanced framework
     print("\n\n--- Phase 2: Running 1-Shot Enhanced Framework ---")
     one_shot_results = run_continual_task_sequence(
         ensemble_models, data_manager, k_shot=1, device=device,
         delta_low=args.delta_low, delta_high=args.delta_high, temperature=args.temperature,
-        train_compression=args.train_compression, compression_epochs=args.compression_epochs
+        train_compression=args.train_compression, compression_epochs=args.compression_epochs,
+        batch_size=args.batch_size
     )
     
     # Phase 3: 5-shot with enhanced framework
@@ -337,7 +376,8 @@ if __name__ == "__main__":
     five_shot_results = run_continual_task_sequence(
         ensemble_models, data_manager, k_shot=5, device=device,
         delta_low=args.delta_low, delta_high=args.delta_high, temperature=args.temperature,
-        train_compression=args.train_compression, compression_epochs=args.compression_epochs
+        train_compression=args.train_compression, compression_epochs=args.compression_epochs,
+        batch_size=args.batch_size
     )
     
     # Print results

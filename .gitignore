@@ -1,0 +1,34 @@
+# Dataset and downloaded data (exceed GitHub 100MB limit)
+CALM-v2/episodic-memory/data/
+CALM-v1/CALM-Continual_Adaptive_Learning_Model/dynamic-eval/data/
+CALM-v1/CALM-Continual_Adaptive_Learning_Model/episodic-memory/data/
+CALM-v1/CALM-Continual_Adaptive_Learning_Model/readiness-agent-v2/data/
+**/data/
+*.tar.gz
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+*~
+.DS_Store
+Thumbs.db
+
+# Logs / caches
+*.log
+.cache/

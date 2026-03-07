@@ -1,0 +1,64 @@
+# =============================================================================
+# CALM Repository - .gitignore.example (reference)
+# Copy to .gitignore or merge these rules into your root .gitignore.
+# =============================================================================
+
+# --- Dataset and downloaded data (do not commit; exceed GitHub 100MB limit) ---
+CALM-v2/episodic-memory/data/
+CALM-v1/CALM-Continual_Adaptive_Learning_Model/dynamic-eval/data/
+CALM-v1/CALM-Continual_Adaptive_Learning_Model/episodic-memory/data/
+CALM-v1/CALM-Continual_Adaptive_Learning_Model/readiness-agent-v2/data/
+**/data/
+*.tar.gz
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# --- Virtual environments ---
+.venv/
+venv/
+ENV/
+env/
+
+# --- IDE / editor ---
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# --- OS ---
+.DS_Store
+Thumbs.db
+
+# --- Jupyter ---
+.ipynb_checkpoints/
+
+# --- Logs and caches ---
+*.log
+.cache/
+
+# --- Large model weights (optional; use Git LFS if you need to track them) ---
+# *.pt
+# *.pth
+# *.bin
+# *.safetensors

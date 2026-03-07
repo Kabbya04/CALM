@@ -1,5 +1,13 @@
 # File: ensemble_calibration.py
 # Ensemble Confidence Calibration with Multiple CLIP Variants (Approach 2.2)
+import os
+
+# Force use of safetensors to avoid PyTorch 2.6+ requirement for torch.load
+# This must be set BEFORE importing transformers to take effect
+# This prevents CVE-2025-32434 vulnerability issues
+os.environ['TRANSFORMERS_USE_SAFETENSORS'] = '1'
+os.environ['SAFETENSORS_FAST_GPU'] = '1'
+
 import torch
 import torch.nn.functional as F
 from transformers import CLIPModel, CLIPProcessor
@@ -43,7 +51,17 @@ class EnsembleCLIPModels:
                 try:
                     model_name = model_map[variant]
                     print(f"  Loading {variant} ({model_name})...")
-                    self.models[variant] = CLIPModel.from_pretrained(model_name).to(device)
+                    # Force safetensors usage to avoid PyTorch 2.6+ requirement for torch.load
+                    # This prevents CVE-2025-32434 vulnerability issues
+                    # Try with use_safetensors parameter first
+                    try:
+                        self.models[variant] = CLIPModel.from_pretrained(
+                            model_name, 
+                            use_safetensors=True
+                        ).to(device)
+                    except TypeError:
+                        # If parameter doesn't exist, try without it (should still prefer safetensors)
+                        self.models[variant] = CLIPModel.from_pretrained(model_name).to(device)
                     self.processors[variant] = CLIPProcessor.from_pretrained(model_name)
                     self.models[variant].eval()
                     print(f"  ✓ {variant} loaded successfully")
