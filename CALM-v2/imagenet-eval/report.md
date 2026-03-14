@@ -25,10 +25,10 @@ Both evaluations use the same preprocessed ImageNet directory and the same train
 
 ### 2.1 Few-Shot Learning (5-way 5-shot ImageNet)
 
-| Metric | CALM-v1 | CALM-v2 | Difference |
-|--------|---------|---------|------------|
-| **Mean Accuracy (%)** | **96.88** | **96.16** | -0.72 pp |
-| **95% Confidence Interval** | (paper aggregate) | ± 0.32% | — |
+| Metric | CALM-v1 | CALM-v2 (T=1) | CALM-v2 (T=0.7) | Difference (T=1 vs v1) |
+|--------|---------|---------------|-----------------|------------------------|
+| **Mean Accuracy (%)** | **96.88** | **96.16** | **95.94** | -0.72 pp |
+| **95% Confidence Interval** | (paper aggregate) | ± 0.32% | ± 0.33% | — |
 
 **Analysis:**
 
@@ -38,10 +38,10 @@ Both evaluations use the same preprocessed ImageNet directory and the same train
 
 ### 2.2 Continual Learning (10 tasks, 5-shot, ImageNet)
 
-| Metric | CALM-v1 | CALM-v2 | Difference |
-|--------|---------|---------|------------|
-| **Average Accuracy (%)** | **59.61** | **55.16** | -4.45 pp |
-| **Backward Transfer (BWT) (%)** | **-5.52** | **-5.97** | -0.45 pp (slightly more forgetting) |
+| Metric | CALM-v1 | CALM-v2 (T=1) | CALM-v2 (T=0.7) | Difference (T=1 vs v1) |
+|--------|---------|---------------|-----------------|------------------------|
+| **Average Accuracy (%)** | **59.61** | **55.16** | **54.59** | -4.45 pp |
+| **Backward Transfer (BWT) (%)** | **-5.52** | **-5.97** | **-6.03** | -0.45 pp (slightly more forgetting) |
 
 **Analysis:**
 
@@ -70,15 +70,15 @@ CALM-v2 adds:
 
 ## 4. Summary Table (ImageNet-Aligned)
 
-| Evaluation | Metric | CALM-v1 | CALM-v2 | Note |
-|------------|--------|---------|---------|------|
-| **Few-shot (5-way 5-shot)** | Accuracy (%) | 96.88 | 96.16 ± 0.32 | Slight decrease; still SOTA-level |
-| **Continual (10 tasks, 5-shot)** | Avg. Accuracy (%) | 59.61 | 55.16 | Lower; room for tuning |
-| **Continual (10 tasks, 5-shot)** | BWT (%) | -5.52 | -5.97 | Slightly more forgetting |
+| Evaluation | Metric | CALM-v1 | CALM-v2 (T=1) | CALM-v2 (T=0.7) | Note |
+|------------|--------|---------|---------------|-----------------|------|
+| **Few-shot (5-way 5-shot)** | Accuracy (%) | 96.88 | 96.16 ± 0.32 | 95.94 ± 0.33 | Slight decrease; still SOTA-level |
+| **Continual (10 tasks, 5-shot)** | Avg. Accuracy (%) | 59.61 | 55.16 | 54.59 | Lower; room for tuning |
+| **Continual (10 tasks, 5-shot)** | BWT (%) | -5.52 | -5.97 | -6.03 | Slightly more forgetting |
 
 ---
 
-## 5. Why CALM-v2 Shows Lower Numbers (and How to Improve)
+## 5. Why CALM-v2 Shows Lower Numbers and Improvement strategy
 
 The goal of the ensemble + hierarchical memory was to **increase confidence and performance**. The slightly worse ImageNet numbers come from specific design choices and untuned defaults, not from a fundamental flaw. Below are the main causes and concrete tweaks that can improve results.
 
@@ -103,7 +103,7 @@ The goal of the ensemble + hierarchical memory was to **increase confidence and 
 
 #### (4) **No dataset-specific tuning**
 
-- **Temperature** is fixed at 1.0; for an ensemble, a slightly lower temperature (e.g. 0.7–0.9) can sharpen predictions and recover a bit of accuracy.
+- **Temperature** was initially fixed at 1.0. We tested a slightly lower temperature (0.7) hoping to sharpen predictions, but it actually lowered accuracy slightly (95.94% few-shot, 54.59% continual). Temperature may clearly need more precise tuning, or it isn't the root cause.
 - **Ensemble weights** are uniform (0.5, 0.5). If one variant is better on ImageNet, learning weights (or using only the better variant for the accuracy path) would help.
 - **Compression** is never trained on ImageNet in the current pipeline, so ImageNet continual runs with suboptimal or random compression.
 
@@ -114,32 +114,19 @@ The goal of the ensemble + hierarchical memory was to **increase confidence and 
 | **High** | **Single-space consistency** | Use **one** variant for both building memory and querying (e.g. ViT-B/32 only for the accuracy path). Keep the ensemble only for **confidence** in a readiness agent (deploy vs ask for feedback). | Few-shot and continual accuracy should move back toward v1 (96.88% / 59.61%), while you still get better calibration from the ensemble where it matters. |
 | **High** | **Train compression on ImageNet** | Before running continual: collect a large set of ImageNet embeddings (e.g. 10k–50k), run `memory.train_compression_networks(embeddings, epochs=50)` (or more), then run the 10‑task continual experiment. | Better prototype quality in medium/old tiers → higher avg accuracy and better BWT. |
 | **Medium** | **Ensemble in same space** | If you want to keep ensemble for accuracy: build prototypes from **both** variants (e.g. store mean of ViT-B/32 and ViT-B/16 embeddings per example, or store both and average at prototype time). Query with both and average similarities. Then memory and query are in a consistent “ensemble space.” | Removes cross-space comparison; can recover or exceed single-model accuracy if both models are strong. |
-| **Medium** | **Lower temperature** | Try `--temperature 0.7` or `0.8` in the ImageNet scripts. Optionally tune on a validation set. | Slightly sharper softmax, can recover 0.2–0.5 pp on few-shot. |
+| **Medium** | **Tune temperature** | Find the optimal temperature on a validation set (testing with 0.7 showed a small decrease, but other values e.g., 0.9 or 1.1 might help). | May subtly improve accuracy without retraining. |
 | **Medium** | **Learn ensemble weights** | Use a validation set and `ensemble_models.update_weights(validation_performance)` so the better model gets higher weight. | Reduces damage from the weaker model in the average. |
 | **Low** | **Softer compression for continual** | Delay migration (e.g. increase `tau_recent` / `tau_medium`) or use only recent tier for prototype computation on the first 5–6 tasks so compression has less impact early. | Less reconstruction error early; BWT may improve. |
 | **Low** | **Report single-model + ensemble** | Report accuracy for “ViT-B/32 only” (same as v1 path) and “Ensemble” separately. Use ensemble for confidence/deployment only. | Clearer story: ensemble improves safety/calibration; single model sets the accuracy baseline. |
-
-### 5.3 Minimal-change fix (recommended first step)
-
-To test the “embedding-space mismatch” hypothesis with minimal code change:
-
-1. In **few-shot**: when building memory and when computing query similarities, use **only** the first variant (ViT-B/32). Do not average with ViT-B/16 for the classification decision. Re-run 600 episodes and check if accuracy returns to ~96.8%.
-2. In **continual**: same idea — build memory with ViT-B/32 and evaluate with ViT-B/32 only. Then compare avg accuracy and BWT to v1.
-
-If numbers recover, the drop was largely due to cross-space averaging. You can then keep the ensemble **only for the readiness agent** (confidence and deploy vs feedback), and report: “CALM-v2 preserves v1-level accuracy when using a single backbone for the core engine; the ensemble is used for confidence calibration and deployment decisions.”
 
 ---
 
 ## 6. Conclusions
 
-1. **Few-shot:** CALM-v2 reaches **96.16%** on the same 5-way 5-shot ImageNet benchmark as v1 (96.88%). The **-0.72 pp** gap is small and consistent with the architectural changes; the result remains competitive with the original paper.
+1. **Few-shot:** CALM-v2 reaches **96.16%** (T=1.0) and **95.94%** (T=0.7) on the same 5-way 5-shot ImageNet benchmark as v1 (96.88%). The gap is small and consistent with the architectural changes; the result remains competitive with the original paper.
 
-2. **Continual:** CALM-v2 shows **55.16%** average accuracy and **-5.97%** BWT vs v1’s 59.61% and -5.52%. The modest drop in average accuracy and the small increase in forgetting are reasonable given: (a) no dataset-specific tuning of ensemble or temperature, and (b) the added complexity of hierarchical memory over 10 large tasks. BWT remains strong relative to fine-tuning.
+2. **Continual:** CALM-v2 (T=1.0) shows **55.16%** average accuracy and **-5.97%** BWT vs v1’s 59.61% and -5.52%. The T=0.7 run behaves similarly (54.59% acc, -6.03% BWT). The modest drop in average accuracy and the small increase in forgetting are reasonable given: (a) no dataset-specific tuning of ensemble or temperature, and (b) the added complexity of hierarchical memory over 10 large tasks. BWT remains strong relative to fine-tuning.
 
 3. **Trade-offs:** In exchange for the small ImageNet gaps, CALM-v2 provides **ensemble-based confidence**, **2.5× memory capacity**, and **hierarchical compression** that already showed **better BWT on CIFAR-10** (e.g. 1-shot and 5-shot BWT improvements in the episodic-memory report). For a full system comparison, readiness-agent metrics (deployment rate, FPR, deployed accuracy) on ImageNet would complete the picture; the present report focuses on the **core episodic memory + backbone** comparison.
 
-4. **Recommendation:** These ImageNet-aligned results are **sufficient to compare CALM-v2 to CALM-v1** in the paper. Report the table in §4 and briefly note the small accuracy/BWT trade-off and the gains in memory capacity and ensemble calibration.
-
 ---
-
-*Report generated from CALM-v2 ImageNet-aligned evaluation (few-shot: 600 episodes; continual: 10 tasks, 5-shot). CALM-v1 figures from the published paper (calm.tex).*
