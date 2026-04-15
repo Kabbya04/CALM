@@ -14,6 +14,7 @@ space to make results directly comparable to CALM-v1.
 import argparse
 import os
 import ssl
+import sys
 from typing import List, Tuple
 
 import numpy as np
@@ -22,8 +23,16 @@ import torch.nn.functional as F
 from torchvision import transforms
 
 from memory import HierarchicalEpisodicMemory  # type: ignore
-from episodic_memory.ensemble_calibration import EnsembleCLIPModels  # type: ignore
 from imagenet_sampler import ImageNetSampler
+
+# Ensure we can import modules from CALM-v2/episodic-memory.
+THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+CALM_V2_ROOT = os.path.dirname(THIS_DIR)
+EPISODIC_DIR = os.path.join(CALM_V2_ROOT, "episodic-memory")
+if EPISODIC_DIR not in sys.path:
+    sys.path.insert(0, EPISODIC_DIR)
+
+from ensemble_calibration import EnsembleCLIPModels  # type: ignore
 
 
 # --- SSL fix copied from CALM-v1 script to avoid cert issues when transformers download weights ---

@@ -9,6 +9,7 @@ This mirrors CALM-v1's `run_imagenet_continual.py` protocol but uses:
 
 import argparse
 import os
+import sys
 from collections import defaultdict
 from typing import Dict
 
@@ -21,7 +22,15 @@ from torchvision.datasets import ImageNet
 from tqdm import tqdm
 
 from memory import HierarchicalEpisodicMemory  # type: ignore
-from episodic_memory.ensemble_calibration import EnsembleCLIPModels  # type: ignore
+
+# Ensure we can import modules from CALM-v2/episodic-memory.
+THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+CALM_V2_ROOT = os.path.dirname(THIS_DIR)
+EPISODIC_DIR = os.path.join(CALM_V2_ROOT, "episodic-memory")
+if EPISODIC_DIR not in sys.path:
+    sys.path.insert(0, EPISODIC_DIR)
+
+from ensemble_calibration import EnsembleCLIPModels  # type: ignore
 
 
 class ImageNetContinualManager:

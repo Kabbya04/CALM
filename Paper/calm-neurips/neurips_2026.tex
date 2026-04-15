@@ -18,15 +18,27 @@
 \usetikzlibrary{arrows.meta,positioning,fit,calc}
 \usepackage{placeins}
 
-\title{CALM: A Unified v1--v2 Framework for Reliable Few-Shot and Continual Vision\\with Confidence-Aware Deployment}
+\title{CALM: A Continual Adaptive Learning Model with\\Self-Aware Readiness Agent for Reliable Few-Shot\\Vision Systems}
 
-\author{Anonymous Authors}
+\author{%
+Adib Ar Rahman Khan \\
+Department of Electrical and Computer Engineering \\
+North South University \\
+Dhaka, Bangladesh \\
+\texttt{adib.khan01@northsouth.edu}
+\And
+Saumik Saha Kabbya \\
+Department of Electrical and Computer Engineering \\
+North South University \\
+Dhaka, Bangladesh \\
+\texttt{saumik.kabbya@northsouth.edu}
+}
 
 \begin{document}
 \maketitle
 
 \begin{abstract}
-We introduce CALM (Continual Adaptive Learning Model) for few-shot and continual vision with confidence-aware deployment. CALM-v1 combines a frozen vision-language backbone, episodic memory, prototypical classification, and a readiness agent; CALM-v2 extends this design with multi-encoder confidence signals and hierarchical compressed memory. Under protocol-matched ImageNet evaluations (5-way 5-shot episodic learning with 600 episodes; 10-task continual learning with 5-shot memory), we compare both versions to commonly reported baselines and to each other. In our setting, CALM-v1 reaches $96.88\%$ few-shot accuracy and $-5.52\%$ backward transfer (BWT), while CALM-v2 (ensemble) attains $96.16\% \pm 0.32\%$ and $-5.97\%$ BWT at temperature $T=1.0$. We discuss how deployment-oriented changes in v2 may interact with prototype geometry, and we summarize practical recommendations---including a single-backbone ablation protocol---aimed at improving representation consistency. Together, the paper clarifies trade-offs between core task metrics and reliability-oriented design choices in non-parametric VLM adaptation.
+We introduce CALM (Continual Adaptive Learning Model) for few-shot and continual vision with a self-aware readiness agent for deployment decisions. CALM-v1 combines a frozen vision-language backbone, episodic memory, prototypical classification, and calibrated readiness gating; CALM-v2 extends this design with multi-encoder confidence signals and hierarchical compressed memory. Under protocol-matched ImageNet evaluations (5-way 5-shot episodic learning with 600 episodes; 10-task continual learning with 5-shot memory), we compare both versions to commonly reported baselines and to each other. In our setting, CALM-v1 reaches $96.88\%$ few-shot accuracy and $-5.52\%$ backward transfer (BWT), while CALM-v2 (ensemble) attains $96.16\% \pm 0.32\%$ and $-5.97\%$ BWT at temperature $T=1.0$. We discuss how deployment-oriented changes in v2 may interact with prototype geometry, and we summarize practical recommendations---including a single-backbone ablation protocol---aimed at improving representation consistency. Overall, the paper characterizes practical trade-offs between core task metrics and reliability-oriented design choices in non-parametric VLM adaptation.
 \end{abstract}
 
 \section{Introduction}
@@ -36,17 +48,20 @@ CALM-v1 follows this line by keeping the VLM frozen, maintaining an episodic mem
 
 CALM-v2 explores a natural next step: richer confidence estimates from disagreement across two CLIP encoders, together with hierarchical memory that compresses older embeddings to stretch effective capacity. These changes are motivated by deployment settings where uncertainty quality and memory growth matter, but they also couple multiple representation spaces to shared prototypes in ways that are easy to underestimate during design.
 
-\textbf{Scope and novelty.} CALM-v1 and CALM-v2 are both our contributions and, to the best of our knowledge, have not been published before. This submission presents them together: we (i) define CALM-v1 and its extension CALM-v2, (ii) evaluate both under identical ImageNet episodic and continual protocols alongside standard baselines, (iii) analyze where v2 differs from v1 in our measurements and discuss plausible mechanisms (with emphasis on cross-encoder consistency), and (iv) specify a single-backbone CALM-v2 ablation and reproducibility-oriented detail. The emphasis is on an integrated system---frozen VLM, episodic prototypes, calibrated deployment gating, and optional ensemble/hierarchical-memory extensions---rather than on any single isolated component.
+\textbf{Scope and novelty.} CALM-v1 and CALM-v2 are both our contributions and, to the best of our knowledge, have not been published previously. The manuscript presents a unified formulation that combines non-parametric adaptation with explicit deployment readiness: (i) CALM-v1 defines a frozen-VLM prototype learner with calibrated self-aware gating, (ii) CALM-v2 extends this with multi-view confidence and hierarchical memory compression for long-horizon operation, (iii) both variants are evaluated under matched ImageNet episodic and continual protocols, and (iv) we include a single-backbone CALM-v2 ablation to isolate representation-consistency effects from memory design. The emphasis is on an integrated system---frozen VLM, episodic prototypes, calibrated deployment gating, and optional ensemble/hierarchical-memory extensions---rather than on any single isolated component.
 
 \textbf{Contributions.}
 \begin{itemize}
-    \item We introduce CALM with two instantiations---CALM-v1 (frozen CLIP, episodic memory, prototypical classification, readiness agent) and CALM-v2 (multi-encoder confidence and hierarchical compressed memory)---and report ImageNet results under matched evaluation scripts and temperatures.
+    \item We introduce CALM with two instantiations---CALM-v1 (frozen CLIP, episodic memory, prototypical classification, self-aware readiness agent) and CALM-v2 (multi-encoder confidence and hierarchical compressed memory)---and report ImageNet results under matched evaluation scripts and temperatures.
     \item Through implementation-level inspection and the observed metric shifts, we argue that cross-backbone prototype/query inconsistency is a \emph{plausible} and actionable explanation for part of the v2 gap relative to v1, rather than the only possible factor.
     \item We specify a single-backbone CALM-v2 ablation protocol that retains hierarchical memory but scores queries in one encoder space, to separate memory design from fusion effects.
     \item We report reproducibility-oriented protocol and evaluation detail in the main text suitable for NeurIPS-style reporting.
 \end{itemize}
 
 \section{Related Work}
+\paragraph{Coverage and positioning.}
+We position CALM against representative prior directions spanning few-shot meta-learning, CLIP adaptation, continual learning, calibration, and memory scaling (including Prototypical Networks, CLIP, Tip-Adapter, EWC, iCaRL, L2P, DualPrompt, conformal prediction, and hierarchical VLM memory systems~\citep{snell2017proto,radford2021clip,zhang2022tipadapter,kirkpatrick2017ewc,rebuffi2017icarl,wang2022l2p,wang2022dualprompt,angelopoulos2021conformal,deepseekocr2024,deepseekvl22024}). Across these lines, recurring limitations include limited deployment-aware abstention logic, assumptions of parametric adaptation, or reduced attention to representation mismatch when combining multiple frozen encoders. CALM is designed to address these limitations in a single workflow.
+
 \paragraph{Few-shot meta-learning and prototype methods.}
 Prototypical Networks~\citep{snell2017proto} remain a reference for episodic few-shot learning but typically train task-specific encoders from scratch, which can be data-hungry and less aligned with modern frozen VLMs. Subsequent work shows that nearest-prototype or cache-style decision rules on top of frozen features can be surprisingly strong when the backbone is already semantic~\citep{radford2021clip,zhang2022tipadapter}. A recurring limitation of ``adapter-only'' methods, however, is that they seldom couple prediction with an explicit deployment policy: confidence is often treated as a by-product rather than a first-class control signal for abstention or human review.
 
@@ -217,7 +232,7 @@ CALM-v2 (ensemble, T=0.7) & 95.94 $\pm$ 0.33 \\
 \end{tabular}
 \end{table}
 
-CALM-v1 reaches $96.88\%$ accuracy, which is substantially higher than the listed CLIP zero-shot ($85.4\%$) and Tip-Adapter ($89.8\%$) entries under this protocol. CALM-v2 (ensemble) remains higher than those same CLIP-centric baselines at $96.16\% \pm 0.32\%$ (temperature $T=1.0$) and $95.94\% \pm 0.33\%$ ($T=0.7$), suggesting that the additional machinery in v2 does not remove the gains from episodic prototypes in our setting, while modestly lowering the point estimate relative to v1.
+CALM-v1 reaches $96.88\%$ accuracy, which is higher than the listed CLIP zero-shot ($85.4\%$) and Tip-Adapter ($89.8\%$) entries under this protocol. CALM-v2 (ensemble) remains above those same CLIP-centric baselines at $96.16\% \pm 0.32\%$ (temperature $T=1.0$) and $95.94\% \pm 0.33\%$ ($T=0.7$), suggesting that the additional machinery in v2 preserves most few-shot benefits of episodic prototypes in the evaluated setting, while modestly lowering the point estimate relative to v1.
 
 \paragraph{Continual learning (10 tasks, 100 classes per task).}
 Table~\ref{tab:continual_baselines} reports average accuracy after all tasks and BWT on the same 10-task split. Baselines include a fine-tuning reference (severe forgetting in this table), iCaRL~\citep{rebuffi2017icarl}, and DualPrompt~\citep{wang2022dualprompt}. CALM variants keep the CLIP trunk frozen and rely on episodic memory, which is a different operating point than prompt-based continual learners that adapt internal representations.
@@ -297,7 +312,7 @@ Our study prioritizes protocol alignment across versions, but continual learning
 Reliable adaptation of visual systems may positively impact settings where frequent retraining is infeasible (e.g., low-resource medical triage support and assistive monitoring). Potential risks include over-trust in autonomous decisions and dataset-specific biases from pretrained backbones. CALM-style readiness gating, uncertainty thresholds, and human feedback pathways are intended as mitigations, but careful deployment governance remains essential.
 
 \section{Conclusion}
-We presented CALM-v1 and CALM-v2 as a single non-parametric adaptation story built on frozen VLMs, episodic prototypes, and readiness-aware deployment. Under the ImageNet protocols we used, CALM-v1 yields favorable few-shot accuracy relative to several listed CLIP-centric baselines, and CALM-v2 remains in a similar accuracy range while introducing ensemble confidence and hierarchical memory intended for deployment constraints. The v2 configuration we evaluated shows somewhat lower average continual accuracy than v1 in our tables; we outlined a representation-consistency narrative and engineering steps that may help narrow that gap in future work. We hope this first unified account of both variants, together with benchmarks and limitations, supports further refinement before submission.
+We presented CALM-v1 and CALM-v2 as a non-parametric adaptation framework built on frozen VLMs, episodic prototypes, and a self-aware readiness agent for deployment decisions. Under the ImageNet protocols used here, CALM-v1 shows strong few-shot performance relative to the listed CLIP-centric baselines, and CALM-v2 remains in a similar accuracy range while introducing ensemble confidence and hierarchical memory intended for deployment constraints. The v2 configuration we evaluated shows somewhat lower average continual accuracy than v1 in our tables; we outlined a representation-consistency interpretation and engineering steps that may help narrow that gap in future work. We hope this unified account of both variants, together with benchmarks and limitations, supports further refinement before submission.
 
 \begin{ack}
 This work uses publicly available models and datasets, including CLIP and ImageNet. The project follows the NeurIPS guidelines for reproducibility and responsible reporting to the extent possible in an academic setting with limited compute resources.
