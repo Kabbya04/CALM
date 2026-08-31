@@ -32,3 +32,29 @@ Thumbs.db
 # Logs / caches
 *.log
 .cache/
+
+# Experiment outputs and local run artifacts
+**/results/
+**/outputs/
+**/runs/
+**/checkpoints/
+**/wandb/
+
+# Python tooling
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# LaTeX build artifacts
+*.aux
+*.bbl
+*.bcf
+*.blg
+*.fdb_latexmk
+*.fls
+*.lof
+*.lot
+*.out
+*.run.xml
+*.synctex.gz
+*.toc

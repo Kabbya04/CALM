@@ -18,7 +18,8 @@
 \usetikzlibrary{arrows.meta,positioning,fit,calc}
 \usepackage{placeins}
 
-\title{CALM: A Continual Adaptive Learning Model with\\Self-Aware Readiness Agent for Reliable Few-Shot\\Vision Systems}
+% Omit the \thanks below when building an anonymous NeurIPS submission PDF.
+\title{CALM: A Continual Adaptive Learning Model with\\Self-Aware Readiness Agent for Reliable Few-Shot\\Vision Systems\thanks{This work was supervised by Muhammad Shafayat Oshman, Lecturer, Department of Electrical and Computer Engineering, North South University, Dhaka, Bangladesh.}}
 
 \author{%
 Adib Ar Rahman Khan \\
@@ -48,7 +49,7 @@ CALM-v1 follows this line by keeping the VLM frozen, maintaining an episodic mem
 
 CALM-v2 explores a natural next step: richer confidence estimates from disagreement across two CLIP encoders, together with hierarchical memory that compresses older embeddings to stretch effective capacity. These changes are motivated by deployment settings where uncertainty quality and memory growth matter, but they also couple multiple representation spaces to shared prototypes in ways that are easy to underestimate during design.
 
-\textbf{Scope and novelty.} CALM-v1 and CALM-v2 are both our contributions and, to the best of our knowledge, have not been published previously. The manuscript presents a unified formulation that combines non-parametric adaptation with explicit deployment readiness: (i) CALM-v1 defines a frozen-VLM prototype learner with calibrated self-aware gating, (ii) CALM-v2 extends this with multi-view confidence and hierarchical memory compression for long-horizon operation, (iii) both variants are evaluated under matched ImageNet episodic and continual protocols, and (iv) we include a single-backbone CALM-v2 ablation to isolate representation-consistency effects from memory design. The emphasis is on an integrated system---frozen VLM, episodic prototypes, calibrated deployment gating, and optional ensemble/hierarchical-memory extensions---rather than on any single isolated component.
+\textbf{Scope and novelty.} CALM-v1 and CALM-v2 are our contributions and have not been published previously, to the best of our knowledge. The manuscript presents a unified formulation that combines non-parametric adaptation with explicit deployment readiness: (i) CALM-v1 defines a frozen-VLM prototype learner with calibrated self-aware gating, (ii) CALM-v2 extends this with multi-view confidence and hierarchical memory compression for long-horizon operation, (iii) both variants are evaluated under matched ImageNet episodic and continual protocols, and (iv) we include a single-backbone CALM-v2 ablation to isolate representation-consistency effects from memory design. The emphasis is on an integrated system---frozen VLM, episodic prototypes, calibrated deployment gating, and optional ensemble/hierarchical-memory extensions---rather than on any single isolated component.
 
 \textbf{Contributions.}
 \begin{itemize}
@@ -216,20 +217,20 @@ Table~\ref{tab:fewshot_baselines} uses the standard episodic benchmark on ImageN
 \begin{table}[t]
 \caption{Few-shot ImageNet (5-way 5-shot) comparison against prior methods.}
 \label{tab:fewshot_baselines}
-\centering
+  \centering
 \begin{tabular}{lc}
-\toprule
+    \toprule
 Method & Accuracy (\%) \\
 \midrule
 Prototypical Net (ResNet-12) & 77.5 \\
 CLIP zero-shot (ViT-B/32) & 85.4 \\
 Tip-Adapter (ViT-B/32) & 89.8 \\
-\midrule
+    \midrule
 CALM-v1 & 96.88 \\
 CALM-v2 (ensemble, T=1.0) & 96.16 $\pm$ 0.32 \\
 CALM-v2 (ensemble, T=0.7) & 95.94 $\pm$ 0.33 \\
-\bottomrule
-\end{tabular}
+    \bottomrule
+  \end{tabular}
 \end{table}
 
 CALM-v1 reaches $96.88\%$ accuracy, which is higher than the listed CLIP zero-shot ($85.4\%$) and Tip-Adapter ($89.8\%$) entries under this protocol. CALM-v2 (ensemble) remains above those same CLIP-centric baselines at $96.16\% \pm 0.32\%$ (temperature $T=1.0$) and $95.94\% \pm 0.33\%$ ($T=0.7$), suggesting that the additional machinery in v2 preserves most few-shot benefits of episodic prototypes in the evaluated setting, while modestly lowering the point estimate relative to v1.
