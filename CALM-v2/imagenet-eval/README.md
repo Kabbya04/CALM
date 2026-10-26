@@ -1,40 +1,25 @@
-# CALM-v2 ImageNet Evaluation
+# CALM-v2 ImageNet runners
 
-This folder contains the **ImageNet-aligned few-shot evaluation** for CALM-v2,
-mirroring the protocol used in `CALM-v1/CALM-Continual_Adaptive_Learning_Model/final-evaluation`.
+Same preprocessed ImageNet tree as CALM-v1. Pass it with `--imagenet_root`.
+Do not change the folder layout.
 
-It reuses the **same preprocessed ImageNet directory** you used for CALM-v1, so no
-dataset changes are required.
+```powershell
+conda activate CALM
+cd E:\Academics\CALM\CALM\CALM-v2\imagenet-eval
 
-## Files
+python run_imagenet_evaluation.py --imagenet_root D:\Datasets\imagenet_torchvision --n_way 5 --k_shot 5 --num_query 15 --num_episodes 600 --seed 42 --device cuda
 
-- `run_imagenet_evaluation.py`  
-  Runs N-way K-shot ImageNet episodes using:
-  - `HierarchicalEpisodicMemory` from the CALM-v2 episodic-memory module
-  - `EnsembleCLIPModels` (ViT-B/32, ViT-B/16) for ensemble embeddings
-
-- `imagenet_sampler.py`  
-  A minimal copy of the CALM-v1 ImageNet sampler to index the existing
-  ImageNet tree and provide N-way, K-shot episodes.
-
-## Usage
-
-From the `CALM-v2/imagenet-eval` directory (or with this directory on your
-`PYTHONPATH`), run:
-
-```bash
-python run_imagenet_evaluation.py \
-    --imagenet_root D:\Datasets\imagenet_torchvision \
-    --n_way 5 \
-    --k_shot 5 \
-    --num_query 15 \
-    --num_episodes 600
+python run_imagenet_continual.py --imagenet_root D:\Datasets\imagenet_torchvision --num_tasks 10 --k_shot 5 --seed 42 --device cuda --temperature 1.0
 ```
 
-Adjust `--imagenet_root` to the same path you used for the CALM-v1 evaluation.
+Useful continual flags:
 
-The script will print:
+- `--age_mode per_example` — advance memory age after each stored support so medium/old can fill
+- `--train_compression` — fit the 512→256 and 512→128 codecs first
+- `--flat_memory` — store 512-d only
+- `--single_backbone` — score with ViT-B/32 only
+- `--log_memory` — print tier counts and bytes
+- `--max_bytes N` — evict oldest codes past a byte budget
+- `--output_json path` — write one JSON record
 
-- Mean accuracy across episodes
-- 95% confidence interval (same style as the v1 ImageNet evaluation)
-
+Memory and ensemble code stay in `../episodic-memory/`.

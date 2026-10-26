@@ -1,29 +1,17 @@
-"""Flat episodic memory used by the CALM-v1 final evaluation."""
+"""Re-export the canonical CALM-v1 episodic memory."""
 
-from collections import defaultdict
+import importlib.util
+import os
 
-import torch
+
+def _load():
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "memory.py")
+    spec = importlib.util.spec_from_file_location("calm_v1_memory", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
-class EpisodicMemory:
-    """Store labeled embeddings and compute one prototype per class."""
-
-    def __init__(self):
-        self.storage = defaultdict(list)
-
-    def add_example(self, embedding: torch.Tensor, label: int):
-        self.storage[int(label)].append(embedding.detach().cpu())
-
-    def get_prototypes(self):
-        class_ids = sorted(self.storage)
-        if not class_ids:
-            return torch.empty(0), []
-
-        prototypes = torch.stack(
-            [torch.stack(self.storage[class_id]).mean(dim=0) for class_id in class_ids]
-        )
-        return prototypes, class_ids
-
-    def __len__(self):
-        return sum(len(items) for items in self.storage.values())
-
+_module = _load()
+EpisodicMemory = _module.EpisodicMemory
+__all__ = ["EpisodicMemory"]

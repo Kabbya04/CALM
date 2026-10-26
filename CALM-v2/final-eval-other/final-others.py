@@ -78,6 +78,15 @@ def parse_args():
         action="store_true",
         help="Use only the first CLIP variant for query classification.",
     )
+    parser.add_argument("--output_json", default=None)
+    parser.add_argument("--flat_memory", action="store_true")
+    parser.add_argument("--train_compression", action="store_true")
+    parser.add_argument("--compression_epochs", type=int, default=50)
+    parser.add_argument("--tau_recent", type=int, default=100)
+    parser.add_argument("--tau_medium", type=int, default=500)
+    parser.add_argument("--age_mode", choices=["per_task", "per_example", "per_class"], default="per_task")
+    parser.add_argument("--log_memory", action="store_true")
+    parser.add_argument("--max_bytes", type=int, default=None)
     return parser.parse_args()
 
 
@@ -285,6 +294,7 @@ def run_continual(
     num_tasks: int,
     temperature: float,
     single_backbone: bool,
+    args=None,
 ):
     targets = get_targets(dataset)
     class_ids = sorted(int(class_id) for class_id in np.unique(targets))
@@ -294,7 +304,16 @@ def run_continual(
 
     classes_per_task = class_count // num_tasks
     class_to_indices = build_class_index(dataset)
-    memory = HierarchicalEpisodicMemory(device=device)
+    memory = HierarchicalEpisodicMemory(
+        device=device,
+        tau_recent=getattr(args, "tau_recent", 100),
+        tau_medium=getattr(args, "tau_medium", 500),
+        flat_memory=getattr(args, "flat_memory", False),
+        max_bytes=getattr(args, "max_bytes", None),
+    )
+    codec_path = getattr(args, "_codec_path", None) if args is not None else None
+    if codec_path and os.path.exists(codec_path):
+        memory.load_codecs(codec_path)
     results = np.zeros((num_tasks, num_tasks), dtype=np.float64)
     first_variant = list(ensemble_models.models.keys())[0]
 
@@ -315,8 +334,15 @@ def run_continual(
                 memory.add_example(
                     embedding, label, importance=1.0, task_id=task_id
                 )
+                if args is not None and args.age_mode == "per_example":
+                    memory.increment_episode()
+            if args is not None and args.age_mode == "per_class":
+                memory.increment_episode()
 
-        memory.increment_episode()
+        if args is None or args.age_mode == "per_task":
+            memory.increment_episode()
+        if args is not None and args.log_memory:
+            print(f"  memory stats: {memory.memory_stats()}")
 
         for seen_task in range(task_id + 1):
             seen_classes = class_ids[
@@ -345,7 +371,7 @@ def run_continual(
     bwt = float(
         np.mean(results[-1, :-1] - np.diag(results)[:-1]) if num_tasks > 1 else 0.0
     )
-    return avg_accuracy, bwt
+    return avg_accuracy, bwt, memory.memory_stats()
 
 
 def main():
@@ -413,7 +439,21 @@ def main():
         f"\n--- Continual: {num_tasks} tasks, "
         f"{args.k_shot}-shot memory/class ---"
     )
-    avg_accuracy, bwt = run_continual(
+    if args.train_compression:
+        print("Training compression networks on a random embedding sample...")
+        sample_idx = np.random.choice(len(dataset), size=min(1024, len(dataset)), replace=False)
+        first_variant = list(ensemble_models.models.keys())[0]
+        sample_images = [get_image(dataset, int(i))[0] for i in sample_idx]
+        sample_emb = embed_images(sample_images, ensemble_models, device, args.batch_size, first_variant)
+        warmup = HierarchicalEpisodicMemory(
+            device=device, tau_recent=args.tau_recent, tau_medium=args.tau_medium
+        )
+        warmup.train_compression_networks(sample_emb, epochs=args.compression_epochs)
+        codec_path = os.path.join(os.path.dirname(__file__), "codecs_last.pt")
+        warmup.save_codecs(codec_path)
+        args._codec_path = codec_path
+
+    avg_accuracy, bwt, memory_stats = run_continual(
         dataset,
         ensemble_models,
         device,
@@ -422,9 +462,30 @@ def main():
         num_tasks,
         args.temperature,
         args.single_backbone,
+        args,
     )
     print(f"Average Accuracy (%): {avg_accuracy:.2f}")
     print(f"Backward Transfer (BWT): {bwt:.2f}")
+    if args.output_json:
+        import json
+
+        os.makedirs(os.path.dirname(os.path.abspath(args.output_json)) or ".", exist_ok=True)
+        with open(args.output_json, "w", encoding="utf-8") as handle:
+            json.dump(
+                {
+                    "variant": "calm_v2_single" if args.single_backbone else "calm_v2",
+                    "dataset": args.datasetname,
+                    "protocol": "few_shot+continual",
+                    "seed": args.seed,
+                    "mean_accuracy": mean_accuracy,
+                    "ci95": confidence_interval,
+                    "avg_acc": avg_accuracy,
+                    "bwt": bwt,
+                    "memory": memory_stats,
+                },
+                handle,
+                indent=2,
+            )
 
 
 if __name__ == "__main__":

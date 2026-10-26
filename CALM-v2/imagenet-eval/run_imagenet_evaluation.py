@@ -21,6 +21,7 @@ Example usage (same as CALM-v1, but from CALM-v2 folder):
 """
 
 import argparse
+import json
 import os
 import ssl
 import sys
@@ -72,10 +73,20 @@ def parse_args():
         default=1.0,
         help="Temperature for ensemble softmax (used when combining models).",
     )
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--device", choices=["auto", "cuda", "cpu"], default="auto")
+    parser.add_argument("--output_json", default=None)
+    parser.add_argument("--single_backbone", action="store_true")
     return parser.parse_args()
 
 
-def get_best_device() -> str:
+def get_best_device(requested: str = "auto") -> str:
+    if requested == "cpu":
+        return "cpu"
+    if requested == "cuda":
+        if not torch.cuda.is_available():
+            raise RuntimeError("CUDA was requested but is unavailable.")
+        return "cuda"
     if torch.cuda.is_available():
         return "cuda"
     if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
@@ -118,6 +129,7 @@ def evaluate_episode(
     device: str,
     batch_size: int,
     temperature: float,
+    single_backbone: bool = False,
 ) -> float:
     """
     Run a single N-way K-shot ImageNet episode with CALM-v2 components.
@@ -149,16 +161,23 @@ def evaluate_episode(
         for i in range(0, len(query_images), batch_size):
             batch = query_images[i : i + batch_size]
 
-            # Get features from all ensemble variants
-            all_features = ensemble_models.get_image_features(batch)
+            first_variant = list(ensemble_models.models.keys())[0]
+            if single_backbone:
+                features = F.normalize(
+                    ensemble_models.get_image_features(batch, variant=first_variant),
+                    p=2,
+                    dim=1,
+                )
+                ensemble_probs = F.softmax((features @ prototypes.T) / temperature, dim=1)
+            else:
+                all_features = ensemble_models.get_image_features(batch)
+                similarities = ensemble_models.compute_prototype_similarities(
+                    all_features, prototypes, class_ids
+                )
+                ensemble_probs, _ = ensemble_models.ensemble_confidence(
+                    similarities, temperature=temperature
+                )
 
-            # Compute per-variant similarities to prototypes
-            similarities = ensemble_models.compute_prototype_similarities(all_features, prototypes, class_ids)
-
-            # Turn similarities into ensemble probabilities
-            ensemble_probs, _ = ensemble_models.ensemble_confidence(similarities, temperature=temperature)
-
-            # Predicted class indices in the prototype list
             pred_indices = torch.argmax(ensemble_probs, dim=1)
             predicted_class_ids = torch.tensor([class_ids[p] for p in pred_indices], device=device)
 
@@ -170,7 +189,9 @@ def evaluate_episode(
 
 def main():
     args = parse_args()
-    device = get_best_device()
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    device = get_best_device(args.device)
     print(f"Using device: {device}")
 
     # 1) Initialize ensemble CLIP models (same models used elsewhere in CALM-v2)
@@ -205,6 +226,7 @@ def main():
             device,
             batch_size=args.batch_size,
             temperature=args.temperature,
+            single_backbone=args.single_backbone,
         )
         all_accuracies.append(acc)
 
@@ -223,6 +245,21 @@ def main():
     print(f"Mean Accuracy: {mean_accuracy:.2f}%")
     print(f"95% Confidence Interval: +/- {confidence_interval:.2f}%")
     print("-" * 60)
+    if args.output_json:
+        os.makedirs(os.path.dirname(os.path.abspath(args.output_json)) or ".", exist_ok=True)
+        with open(args.output_json, "w", encoding="utf-8") as handle:
+            json.dump(
+                {
+                    "variant": "calm_v2_single" if args.single_backbone else "calm_v2",
+                    "dataset": "imagenet",
+                    "protocol": "few_shot",
+                    "seed": args.seed,
+                    "mean_accuracy": mean_accuracy,
+                    "ci95": float(confidence_interval),
+                },
+                handle,
+                indent=2,
+            )
 
 
 if __name__ == "__main__":

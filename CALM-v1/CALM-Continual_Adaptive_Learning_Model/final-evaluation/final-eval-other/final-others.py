@@ -63,6 +63,8 @@ def parse_args():
         default="auto",
         help="Execution device. Use cuda to require the NVIDIA GPU.",
     )
+    parser.add_argument("--output_json", default=None)
+    parser.add_argument("--max_bytes", type=int, default=None)
     return parser.parse_args()
 
 
@@ -198,7 +200,7 @@ def evaluate_indices(indices, dataset, memory, model, processor, device, batch_s
     return (correct / total) * 100.0 if total else 0.0
 
 
-def run_continual(dataset, model, processor, device, batch_size, k_shot, num_tasks):
+def run_continual(dataset, model, processor, device, batch_size, k_shot, num_tasks, max_bytes=None):
     targets = get_targets(dataset)
     class_count = int(targets.max()) + 1
     classes_per_task = class_count // num_tasks
@@ -209,7 +211,7 @@ def run_continual(dataset, model, processor, device, batch_size, k_shot, num_tas
         class_id: np.flatnonzero(targets == class_id) for class_id in range(class_count)
     }
     results = np.zeros((num_tasks, num_tasks), dtype=np.float64)
-    memory = EpisodicMemory()
+    memory = EpisodicMemory(max_bytes=max_bytes)
 
     for task_id in range(num_tasks):
         task_classes = range(task_id * classes_per_task, (task_id + 1) * classes_per_task)
@@ -289,10 +291,29 @@ def main():
         f"\n--- Continual: {num_tasks} tasks, {args.k_shot}-shot memory/class ---"
     )
     avg_accuracy, bwt = run_continual(
-        dataset, model, processor, device, args.batch_size, args.k_shot, num_tasks
+        dataset, model, processor, device, args.batch_size, args.k_shot, num_tasks, args.max_bytes
     )
     print(f"Average Accuracy (%): {avg_accuracy:.2f}")
     print(f"Backward Transfer (BWT): {bwt:.2f}")
+    if args.output_json:
+        import json
+
+        os.makedirs(os.path.dirname(os.path.abspath(args.output_json)) or ".", exist_ok=True)
+        with open(args.output_json, "w", encoding="utf-8") as handle:
+            json.dump(
+                {
+                    "variant": "calm_v1",
+                    "dataset": args.datasetname,
+                    "protocol": "few_shot+continual",
+                    "seed": args.seed,
+                    "mean_accuracy": mean,
+                    "ci95": ci,
+                    "avg_acc": avg_accuracy,
+                    "bwt": bwt,
+                },
+                handle,
+                indent=2,
+            )
 
 
 if __name__ == "__main__":

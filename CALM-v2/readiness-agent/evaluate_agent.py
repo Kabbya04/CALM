@@ -25,8 +25,9 @@ def parse_args():
     parser.add_argument('--dataset', type=str, default='cifar10', 
                         choices=['cifar10', 'cifar100', 'fashionmnist', 'stl10'],
                         help='Dataset to use for the experiment.')
-    parser.add_argument('--k_shot', type=int, default=10, 
-                        help='Number of examples per class in memory.')
+    parser.add_argument('--k_shot', type=int, default=5,
+                        help='Number of examples per class in memory. Paper protocol is 5.')
+    parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--threshold', type=float, default=0.7, 
                         help='Initial confidence threshold for the agent.')
     parser.add_argument('--adaptive', action='store_true', default=True,
@@ -294,8 +295,8 @@ def main():
     args = parse_args()
     
     # Set random seeds for reproducibility
-    torch.manual_seed(42)
-    np.random.seed(42)
+    torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
     
     try:
         run_evaluation(args)

@@ -49,58 +49,62 @@ class CompressionNetwork(nn.Module):
 
 class HierarchicalEpisodicMemory:
     """
-    Enhanced episodic memory with hierarchical compression inspired by DeepSeek OCR.
-    
-    Three-tier memory architecture:
-    - M_recent: Full 512-dim embeddings (0-100 episodes ago)
-    - M_medium: 2× compressed 256-dim embeddings (100-500 episodes ago)
-    - M_old: 4× compressed 128-dim embeddings or prototypes (>500 episodes ago)
+    Hierarchical episodic memory with optional compression.
+
+    Tiers:
+    - recent: full 512-d embeddings while age <= tau_recent
+    - medium: 256-d codes while age <= tau_medium
+    - old: 128-d codes after that
+
+    Migration only happens when increment_episode() advances current_episode
+    far enough past an example's timestamp. Use age_mode='per_example' in the
+    runner if a 5-10 task stream should reach medium/old.
     """
-    def __init__(self, device='cpu', compression_ratios=None):
-        """
-        Initialize hierarchical memory.
-        
-        Args:
-            device: Device to store tensors on
-            compression_ratios: Dict with compression ratios for each tier
-        """
+    def __init__(
+        self,
+        device='cpu',
+        compression_ratios=None,
+        tau_recent=100,
+        tau_medium=500,
+        flat_memory=False,
+        max_bytes=None,
+    ):
         self.device = device
-        
-        # Compression ratios: {tier: (compressed_dim, compression_factor)}
+        self.flat_memory = bool(flat_memory)
+        self.max_bytes = max_bytes
+        self.last_migration_moved = 0
+
         if compression_ratios is None:
             compression_ratios = {
-                'recent': (512, 1),      # No compression
-                'medium': (256, 2),      # 2× compression
-                'old': (128, 4)          # 4× compression
+                'recent': (512, 1),
+                'medium': (256, 2),
+                'old': (128, 4),
             }
         self.compression_ratios = compression_ratios
-        
-        # Memory tiers: {tier: {class_id: [(embedding, timestamp, importance)]}}
+
         self.memory_tiers = {
             'recent': defaultdict(list),
             'medium': defaultdict(list),
-            'old': defaultdict(list)
+            'old': defaultdict(list),
         }
-        
-        # Compression networks for each tier
+
         self.compression_networks = {}
-        for tier, (compressed_dim, _) in compression_ratios.items():
-            if compressed_dim < 512:
-                self.compression_networks[tier] = CompressionNetwork(
-                    input_dim=512, compressed_dim=compressed_dim
-                ).to(device)
-        
-        # Episode counter
+        if not self.flat_memory:
+            for tier, (compressed_dim, _) in compression_ratios.items():
+                if compressed_dim < 512:
+                    self.compression_networks[tier] = CompressionNetwork(
+                        input_dim=512, compressed_dim=compressed_dim
+                    ).to(device)
+
         self.current_episode = 0
-        
-        # Compression thresholds (in episodes)
-        self.tau_recent = 100  # Recent memory threshold
-        self.tau_medium = 500  # Medium memory threshold
-        
-        # Prototype storage for old tasks
-        self.prototypes = defaultdict(dict)  # {task_id: {class_id: prototype}}
-        
-        print("Hierarchical Episodic Memory initialized with compression support.")
+        self.tau_recent = int(tau_recent)
+        self.tau_medium = int(tau_medium)
+        self.prototypes = defaultdict(dict)
+        mode = "flat 512-d" if self.flat_memory else "hierarchical"
+        print(
+            f"Hierarchical Episodic Memory initialized ({mode}, "
+            f"tau_recent={self.tau_recent}, tau_medium={self.tau_medium})."
+        )
     
     def _get_tier_for_episode(self, episode: int) -> str:
         """Determine which tier an embedding should be stored in based on age."""
@@ -156,8 +160,7 @@ class HierarchicalEpisodicMemory:
         # Ensure embedding is on CPU and detached
         embedding = embedding.detach().cpu()
         
-        # Determine tier based on current episode
-        tier = 'recent'  # New examples always go to recent tier
+        tier = 'recent'
         
         # Compress if needed
         compressed = self._compress_embedding(embedding, tier)
@@ -165,9 +168,13 @@ class HierarchicalEpisodicMemory:
         # Store with timestamp and importance
         timestamp = self.current_episode
         self.memory_tiers[tier][label].append((compressed, timestamp, importance, task_id))
+        self.enforce_budget()
     
     def _migrate_memory(self):
         """Migrate old examples to appropriate tiers based on age."""
+        self.last_migration_moved = 0
+        if self.flat_memory:
+            return
         for tier in ['recent', 'medium']:
             for class_id in list(self.memory_tiers[tier].keys()):
                 examples = self.memory_tiers[tier][class_id]
@@ -194,6 +201,7 @@ class HierarchicalEpisodicMemory:
                 
                 # Add to new tier
                 if migrated:
+                    self.last_migration_moved += len(migrated)
                     target_tier = self._get_tier_for_episode(migrated[0][1])
                     for item in migrated:
                         self.memory_tiers[target_tier][class_id].append(item)
@@ -207,12 +215,14 @@ class HierarchicalEpisodicMemory:
                 # Decompress all embeddings
                 decompressed = []
                 for emb, timestamp, importance, task_id in examples:
-                    decompressed_emb = self._decompress_embedding(emb, 'old')
+                    decompressed_emb = self._decompress_embedding(emb, 'old').to(self.device)
                     decompressed.append((decompressed_emb, importance))
                 
                 # Compute weighted prototype
                 embeddings = torch.stack([e for e, _ in decompressed])
-                weights = torch.tensor([w for _, w in decompressed], dtype=torch.float32)
+                weights = torch.tensor(
+                    [w for _, w in decompressed], dtype=torch.float32, device=self.device
+                )
                 if weights.sum() > 0:
                     weights = weights / weights.sum()  # Normalize
                 else:
@@ -234,17 +244,90 @@ class HierarchicalEpisodicMemory:
                 if task_id is not None:
                     self.prototypes[task_id][class_id] = prototype_compressed
     
-    def increment_episode(self):
-        """Increment episode counter and migrate/consolidate memory."""
-        self.current_episode += 1
-        
-        # Periodically migrate memory
-        if self.current_episode % 50 == 0:
-            self._migrate_memory()
-        
-        # Periodically consolidate old memory
-        if self.current_episode % 200 == 0:
-            self._consolidate_old_memory()
+    def increment_episode(self, steps=1):
+        """Advance the age clock and migrate examples that crossed a tier."""
+        for _ in range(max(1, int(steps))):
+            self.current_episode += 1
+            if not self.flat_memory:
+                self._migrate_memory()
+                if self.current_episode % 200 == 0:
+                    self._consolidate_old_memory()
+            self.enforce_budget()
+
+    def _tier_dim(self, tier: str) -> int:
+        return int(self.compression_ratios.get(tier, (512, 1))[0])
+
+    def tier_counts(self) -> dict:
+        counts = {}
+        for tier, by_class in self.memory_tiers.items():
+            counts[tier] = sum(len(examples) for examples in by_class.values())
+        return counts
+
+    def stored_bytes(self, include_codecs: bool = False) -> int:
+        total = 0
+        for tier, by_class in self.memory_tiers.items():
+            n = sum(len(examples) for examples in by_class.values())
+            total += n * self._tier_dim(tier) * 4
+        if include_codecs:
+            for network in self.compression_networks.values():
+                total += sum(int(p.numel()) * 4 for p in network.parameters())
+        return int(total)
+
+    def reconstruction_mse(self, embeddings: torch.Tensor) -> dict:
+        """MSE of each trained codec on a batch of 512-d embeddings."""
+        if embeddings is None or embeddings.numel() == 0:
+            return {}
+        embeddings = embeddings.to(self.device)
+        scores = {}
+        for tier, network in self.compression_networks.items():
+            network.eval()
+            with torch.no_grad():
+                _, reconstructed = network(embeddings)
+                scores[tier] = float(F.mse_loss(reconstructed, embeddings).item())
+        return scores
+
+    def memory_stats(self) -> dict:
+        return {
+            "episode": self.current_episode,
+            "examples": len(self),
+            "tier_counts": self.tier_counts(),
+            "stored_bytes": self.stored_bytes(),
+            "last_migration_moved": self.last_migration_moved,
+            "flat_memory": self.flat_memory,
+            "tau_recent": self.tau_recent,
+            "tau_medium": self.tau_medium,
+        }
+
+    def enforce_budget(self):
+        """Drop oldest examples until stored codes fit in max_bytes."""
+        if self.max_bytes is None:
+            return
+        while self.stored_bytes() > self.max_bytes and len(self) > 0:
+            oldest = None
+            for tier in ("recent", "medium", "old"):
+                for class_id, examples in self.memory_tiers[tier].items():
+                    for idx, item in enumerate(examples):
+                        timestamp = item[1]
+                        if oldest is None or timestamp < oldest[0]:
+                            oldest = (timestamp, tier, class_id, idx)
+            if oldest is None:
+                break
+            _, tier, class_id, idx = oldest
+            del self.memory_tiers[tier][class_id][idx]
+
+    def save_codecs(self, path: str):
+        payload = {
+            name: network.state_dict()
+            for name, network in self.compression_networks.items()
+        }
+        torch.save(payload, path)
+
+    def load_codecs(self, path: str):
+        payload = torch.load(path, map_location=self.device)
+        for name, state in payload.items():
+            if name in self.compression_networks:
+                self.compression_networks[name].load_state_dict(state)
+                self.compression_networks[name].eval()
     
     def get_prototypes(self) -> Tuple[torch.Tensor, List[int]]:
         """
@@ -271,7 +354,7 @@ class HierarchicalEpisodicMemory:
                 if class_id in self.memory_tiers[tier]:
                     for emb, timestamp, importance, task_id in self.memory_tiers[tier][class_id]:
                         # Decompress if needed
-                        decompressed = self._decompress_embedding(emb, tier)
+                        decompressed = self._decompress_embedding(emb, tier).to(self.device)
                         all_examples.append((decompressed, importance))
             
             if not all_examples:
@@ -279,7 +362,9 @@ class HierarchicalEpisodicMemory:
             
             # Compute weighted prototype
             embeddings = torch.stack([e for e, _ in all_examples])
-            weights = torch.tensor([w for _, w in all_examples], dtype=torch.float32)
+            weights = torch.tensor(
+                [w for _, w in all_examples], dtype=torch.float32, device=self.device
+            )
             if weights.sum() > 0:
                 weights = weights / weights.sum()  # Normalize
             else:

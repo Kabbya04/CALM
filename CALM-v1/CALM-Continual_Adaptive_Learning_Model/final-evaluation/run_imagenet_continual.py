@@ -22,6 +22,7 @@ from torch.utils.data import Subset, DataLoader
 from transformers import CLIPProcessor, CLIPModel
 import numpy as np
 import argparse
+import json
 from tqdm import tqdm
 import ssl
 from collections import defaultdict
@@ -110,9 +111,9 @@ def evaluate_on_memory_prototypical(memory, model, processor, test_loader, devic
             
     return (correct / total) * 100 if total > 0 else 0.0
 
-def run_continual_task_sequence(model, processor, data_manager, k_shot, device, batch_size):
+def run_continual_task_sequence(model, processor, data_manager, k_shot, device, batch_size, max_bytes=None):
     """Runs a full continual learning sequence and calculates BWT and Avg. Accuracy."""
-    memory = EpisodicMemory()
+    memory = EpisodicMemory(max_bytes=max_bytes)
     num_tasks = data_manager.num_tasks
     results_matrix = np.zeros((num_tasks, num_tasks))
 
@@ -163,16 +164,28 @@ def parse_args():
     parser.add_argument('--num_tasks', type=int, default=10, help='Number of sequential tasks to create from 1000 classes.')
     parser.add_argument('--k_shot', type=int, default=5, help='Number of support examples per class.')
     parser.add_argument('--batch_size', type=int, default=128, help='Batch size for evaluation.')
+    parser.add_argument('--seed', type=int, default=42)
+    parser.add_argument('--device', choices=['auto', 'cuda', 'cpu'], default='auto')
+    parser.add_argument('--output_json', default=None)
+    parser.add_argument('--max_bytes', type=int, default=None)
     return parser.parse_args()
 
-def get_best_device():
+def get_best_device(requested="auto"):
+    if requested == "cpu":
+        return "cpu"
+    if requested == "cuda":
+        if not torch.cuda.is_available():
+            raise RuntimeError("CUDA was requested but is unavailable.")
+        return "cuda"
     if torch.cuda.is_available(): return "cuda"
     if hasattr(torch.backends, "mps") and torch.backends.mps.is_available(): return "mps"
     return "cpu"
 
 def main():
     args = parse_args()
-    device = get_best_device()
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    device = get_best_device(args.device)
     print(f"Using device: {device}")
 
     print("\n--- WARNING: This is a long-running experiment! ---")
@@ -193,7 +206,15 @@ def main():
     data_manager = ImageNetContinualManager(root=args.imagenet_root, split='val', transform=transform, num_tasks=args.num_tasks)
     
     print(f"\n--- Running {args.k_shot}-Shot Continual Prototypical Network Sequence ---")
-    results = run_continual_task_sequence(model, processor, data_manager, k_shot=args.k_shot, device=device, batch_size=args.batch_size)
+    results = run_continual_task_sequence(
+        model,
+        processor,
+        data_manager,
+        k_shot=args.k_shot,
+        device=device,
+        batch_size=args.batch_size,
+        max_bytes=args.max_bytes,
+    )
     
     print(f"\n\n{'='*60}\n    Final Continual Learning Results on ImageNet\n{'='*60}")
     print(f"{'Metric':<25} | {'Value':<20}")
@@ -205,6 +226,21 @@ def main():
     print(f"{'Backward Transfer (BWT)':<25} | {results['bwt']:.2f}")
     print(f"-"*50)
     print("\nBWT Definition: A value close to 0 indicates low forgetting. A large negative value indicates severe catastrophic forgetting.")
+    if args.output_json:
+        os.makedirs(os.path.dirname(os.path.abspath(args.output_json)) or ".", exist_ok=True)
+        with open(args.output_json, "w", encoding="utf-8") as handle:
+            json.dump(
+                {
+                    "variant": "calm_v1",
+                    "dataset": "imagenet",
+                    "protocol": "continual",
+                    "seed": args.seed,
+                    "avg_acc": float(results["avg_acc"]),
+                    "bwt": float(results["bwt"]),
+                },
+                handle,
+                indent=2,
+            )
 
 if __name__ == "__main__":
     main()

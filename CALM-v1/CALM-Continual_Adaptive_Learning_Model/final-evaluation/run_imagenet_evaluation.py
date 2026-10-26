@@ -8,6 +8,8 @@ from torchvision import transforms
 from transformers import CLIPProcessor, CLIPModel
 import numpy as np
 import argparse
+import json
+import os
 from tqdm import tqdm
 import ssl
 
@@ -27,9 +29,18 @@ def parse_args():
     parser.add_argument('--num_episodes', type=int, default=600, 
                         help='Number of episodes to average over for a stable result.')
     parser.add_argument('--batch_size', type=int, default=32, help='Batch size for processing embeddings.')
+    parser.add_argument('--seed', type=int, default=42)
+    parser.add_argument('--device', choices=['auto', 'cuda', 'cpu'], default='auto')
+    parser.add_argument('--output_json', default=None)
     return parser.parse_args()
 
-def get_best_device():
+def get_best_device(requested="auto"):
+    if requested == "cpu":
+        return "cpu"
+    if requested == "cuda":
+        if not torch.cuda.is_available():
+            raise RuntimeError("CUDA was requested but is unavailable.")
+        return "cuda"
     if torch.cuda.is_available(): return "cuda"
     if hasattr(torch.backends, "mps") and torch.backends.mps.is_available(): return "mps"
     return "cpu"
@@ -82,7 +93,9 @@ def run_single_episode(support_set, query_set, model, processor, device, batch_s
 
 def main():
     args = parse_args()
-    device = get_best_device()
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    device = get_best_device(args.device)
     print(f"Using device: {device}")
 
     # --- 1. Load CLIP Model ---
@@ -126,6 +139,21 @@ def main():
     print(f"Mean Accuracy: {mean_accuracy:.2f}%")
     print(f"95% Confidence Interval: +/- {confidence_interval:.2f}%")
     print("-" * 50)
+    if args.output_json:
+        os.makedirs(os.path.dirname(os.path.abspath(args.output_json)) or ".", exist_ok=True)
+        with open(args.output_json, "w", encoding="utf-8") as handle:
+            json.dump(
+                {
+                    "variant": "calm_v1",
+                    "dataset": "imagenet",
+                    "protocol": "few_shot",
+                    "seed": args.seed,
+                    "mean_accuracy": float(mean_accuracy),
+                    "ci95": float(confidence_interval),
+                },
+                handle,
+                indent=2,
+            )
 
 if __name__ == "__main__":
     main()

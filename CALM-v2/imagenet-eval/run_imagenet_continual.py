@@ -13,6 +13,7 @@ The ImageNet dataset/root should be the same preprocessed tree used for CALM-v1.
 """
 
 import argparse
+import json
 import os
 import sys
 from collections import defaultdict
@@ -79,7 +80,13 @@ class ImageNetContinualManager:
         return Subset(self.dataset, task_indices)
 
 
-def get_best_device() -> str:
+def get_best_device(requested: str = "auto") -> str:
+    if requested == "cpu":
+        return "cpu"
+    if requested == "cuda":
+        if not torch.cuda.is_available():
+            raise RuntimeError("CUDA was requested but is unavailable.")
+        return "cuda"
     if torch.cuda.is_available():
         return "cuda"
     if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
@@ -95,6 +102,7 @@ def evaluate_on_memory_ensemble(
     device: str,
     batch_size: int,
     temperature: float,
+    single_backbone: bool = False,
 ) -> float:
     """
     Evaluate accuracy on a specific task using:
@@ -120,12 +128,22 @@ def evaluate_on_memory_ensemble(
             # Convert batch of tensors back to PIL images for CLIP processors
             pil_images = [transforms.ToPILImage()(img) for img in images]
 
-            # Get features from all models
-            all_features = ensemble_models.get_image_features(pil_images)
-
-            # Compute per-variant similarities and ensemble probabilities
-            similarities = ensemble_models.compute_prototype_similarities(all_features, prototypes, class_ids)
-            ensemble_probs, _ = ensemble_models.ensemble_confidence(similarities, temperature=temperature)
+            first_variant = list(ensemble_models.models.keys())[0]
+            if single_backbone:
+                features = F.normalize(
+                    ensemble_models.get_image_features(pil_images, variant=first_variant),
+                    p=2,
+                    dim=1,
+                )
+                ensemble_probs = F.softmax((features @ prototypes.T) / temperature, dim=1)
+            else:
+                all_features = ensemble_models.get_image_features(pil_images)
+                similarities = ensemble_models.compute_prototype_similarities(
+                    all_features, prototypes, class_ids
+                )
+                ensemble_probs, _ = ensemble_models.ensemble_confidence(
+                    similarities, temperature=temperature
+                )
 
             pred_indices = torch.argmax(ensemble_probs, dim=1)
             predicted_class_ids = torch.tensor([class_ids[i] for i in pred_indices], device=device)
@@ -143,13 +161,22 @@ def run_continual_task_sequence(
     device: str,
     batch_size: int,
     temperature: float,
+    args=None,
 ):
     """
     Runs a full continual learning sequence over ImageNet and computes:
       - Average accuracy over tasks (diag of results matrix)
       - Backward transfer (BWT) as in CALM-v1
     """
-    memory = HierarchicalEpisodicMemory(device=device)
+    memory = HierarchicalEpisodicMemory(
+        device=device,
+        tau_recent=getattr(args, "tau_recent", 100),
+        tau_medium=getattr(args, "tau_medium", 500),
+        flat_memory=getattr(args, "flat_memory", False),
+        max_bytes=getattr(args, "max_bytes", None),
+    )
+    if args is not None and getattr(args, "codec_path", None) and os.path.exists(args.codec_path):
+        memory.load_codecs(args.codec_path)
     num_tasks = data_manager.num_tasks
     results_matrix = np.zeros((num_tasks, num_tasks))
 
@@ -186,9 +213,15 @@ def run_continual_task_sequence(
                     embedding = features.squeeze(0)
 
                 memory.add_example(embedding, int(label), importance=1.0, task_id=task_id)
+                if args is not None and args.age_mode == "per_example":
+                    memory.increment_episode()
+            if args is not None and args.age_mode == "per_class":
+                memory.increment_episode()
 
-        # After finishing a task, increment episode counter (for potential migration)
-        memory.increment_episode()
+        if args is None or args.age_mode == "per_task":
+            memory.increment_episode()
+        if args is not None and args.log_memory:
+            print(f"  memory stats: {memory.memory_stats()}")
 
         # Evaluate on all seen tasks so far
         for j in range(task_id + 1):
@@ -200,6 +233,7 @@ def run_continual_task_sequence(
                 device=device,
                 batch_size=batch_size,
                 temperature=temperature,
+                single_backbone=bool(args.single_backbone) if args is not None else False,
             )
             print(f"  Accuracy on Task {j + 1} after learning Task {task_id + 1}: {acc:.2f}%")
             results_matrix[task_id, j] = acc
@@ -214,7 +248,7 @@ def run_continual_task_sequence(
             bwt += results_matrix[num_tasks - 1, j] - results_matrix[j, j]
         bwt /= (num_tasks - 1)
 
-    return {"avg_acc": avg_accuracy, "bwt": float(bwt)}
+    return {"avg_acc": avg_accuracy, "bwt": float(bwt), "memory": memory.memory_stats()}
 
 
 def parse_args():
@@ -249,12 +283,27 @@ def parse_args():
         default=1.0,
         help="Temperature for ensemble softmax.",
     )
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--device", choices=["auto", "cuda", "cpu"], default="auto")
+    parser.add_argument("--output_json", default=None)
+    parser.add_argument("--single_backbone", action="store_true")
+    parser.add_argument("--flat_memory", action="store_true")
+    parser.add_argument("--train_compression", action="store_true")
+    parser.add_argument("--compression_epochs", type=int, default=50)
+    parser.add_argument("--codec_path", default=None)
+    parser.add_argument("--tau_recent", type=int, default=100)
+    parser.add_argument("--tau_medium", type=int, default=500)
+    parser.add_argument("--age_mode", choices=["per_task", "per_example", "per_class"], default="per_task")
+    parser.add_argument("--log_memory", action="store_true")
+    parser.add_argument("--max_bytes", type=int, default=None)
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
-    device = get_best_device()
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    device = get_best_device(args.device)
     print(f"Using device: {device}")
 
     print(
@@ -282,6 +331,27 @@ def main():
         num_tasks=args.num_tasks,
     )
 
+    if args.train_compression:
+        print("\n--- Training compression networks on a random ImageNet val sample ---")
+        first_variant = list(ensemble_models.models.keys())[0]
+        sample_idx = np.random.choice(len(data_manager.dataset), size=min(2048, len(data_manager.dataset)), replace=False)
+        sample_emb = []
+        warmup = HierarchicalEpisodicMemory(device=device, tau_recent=args.tau_recent, tau_medium=args.tau_medium)
+        for idx in sample_idx:
+            image_tensor, _ = data_manager.dataset[int(idx)]
+            image_pil = transforms.ToPILImage()(image_tensor)
+            with torch.no_grad():
+                sample_emb.append(
+                    ensemble_models.get_image_features([image_pil], variant=first_variant).squeeze(0).cpu()
+                )
+        warmup.train_compression_networks(torch.stack(sample_emb), epochs=args.compression_epochs)
+        if args.codec_path:
+            warmup.save_codecs(args.codec_path)
+            print(f"Saved codecs to {args.codec_path}")
+        else:
+            args.codec_path = os.path.join(THIS_DIR, "codecs_last.pt")
+            warmup.save_codecs(args.codec_path)
+
     print(
         f"\n--- Running {args.k_shot}-shot continual prototypical sequence on ImageNet "
         f"with {args.num_tasks} tasks ---"
@@ -293,6 +363,7 @@ def main():
         device=device,
         batch_size=args.batch_size,
         temperature=args.temperature,
+        args=args,
     )
 
     print(f"\n{'=' * 60}")
@@ -310,6 +381,26 @@ def main():
         "\nBWT Definition: A value close to 0 indicates low forgetting. "
         "A large negative value indicates severe catastrophic forgetting."
     )
+    if args.log_memory:
+        print(f"Final memory: {results.get('memory')}")
+    if args.output_json:
+        os.makedirs(os.path.dirname(os.path.abspath(args.output_json)) or ".", exist_ok=True)
+        with open(args.output_json, "w", encoding="utf-8") as handle:
+            json.dump(
+                {
+                    "variant": "calm_v2_single" if args.single_backbone else "calm_v2",
+                    "dataset": "imagenet",
+                    "protocol": "continual",
+                    "seed": args.seed,
+                    "age_mode": args.age_mode,
+                    "flat_memory": args.flat_memory,
+                    "avg_acc": results["avg_acc"],
+                    "bwt": results["bwt"],
+                    "memory": results.get("memory"),
+                },
+                handle,
+                indent=2,
+            )
 
 
 if __name__ == "__main__":
