@@ -76,69 +76,68 @@ class EnsembleCLIPModels:
             If variant specified: [batch_size, embedding_dim]
             If None: Dict of {variant: [batch_size, embedding_dim]}
         """
+        if not isinstance(images, list):
+            images = [images]
+
         if variant is not None:
             if variant not in self.models:
                 raise ValueError(f"Variant {variant} not available")
-            
             processor = self.processors[variant]
             model = self.models[variant]
-            
             inputs = processor(images=images, return_tensors="pt").to(self.device)
-            with torch.no_grad():
+            with torch.inference_mode():
                 features = model.get_image_features(**inputs)
+            del inputs
             return features
-        
-        else:
-            # Get features from all models
-            all_features = {}
-            for variant, model in self.models.items():
-                processor = self.processors[variant]
-                inputs = processor(images=images, return_tensors="pt").to(self.device)
-                with torch.no_grad():
-                    features = model.get_image_features(**inputs)
-                all_features[variant] = features
-            return all_features
+
+        all_features = {}
+        for name, model in self.models.items():
+            processor = self.processors[name]
+            inputs = processor(images=images, return_tensors="pt").to(self.device)
+            with torch.inference_mode():
+                features = model.get_image_features(**inputs)
+            all_features[name] = features
+            del inputs
+        return all_features
     
-    def compute_prototype_similarities(self, query_features: dict, prototypes: torch.Tensor, 
+    def compute_prototype_similarities(self, query_features: dict, prototypes,
                                        class_ids: List[int]) -> dict:
         """
-        Compute cosine similarities between query features and prototypes for each variant.
-        
+        Cosine similarities per CLIP variant against in-space prototype banks.
+
         Args:
-            query_features: Dict of {variant: [batch_size, embedding_dim]}
-            prototypes: [num_classes, 512] (may need to handle different dims)
-            class_ids: List of class labels
-        
+            query_features: {variant: [batch, dim]}
+            prototypes: either a shared Tensor [num_classes, dim] (legacy) or
+                a dict {variant: Tensor[num_classes, dim]} for per-encoder banks
+            class_ids: class label order matching the prototype rows
+
         Returns:
-            Dict of {variant: [batch_size, num_classes]} similarity scores
+            {variant: [batch, num_classes]} similarity scores
         """
-        prototypes_normalized = F.normalize(prototypes, p=2, dim=1)
-        
+        per_encoder = isinstance(prototypes, dict)
+        shared = None if per_encoder else F.normalize(prototypes, p=2, dim=1)
+
         similarities = {}
         for variant, features in query_features.items():
-            # Normalize query features
             features_normalized = F.normalize(features, p=2, dim=1)
-            
-            # Handle dimension mismatch (different CLIP variants have different embedding dims)
-            # CLIP ViT-B/32: 512, ViT-B/16: 512, ViT-L/14: 768
-            if features.shape[1] != prototypes.shape[1]:
-                # For now, we'll use a simple projection: take first 512 dims or pad
-                # In a full implementation, we'd use a learned projection layer
-                if features.shape[1] > prototypes.shape[1]:
-                    # Truncate to match prototype dimension
-                    features_normalized = features_normalized[:, :prototypes.shape[1]]
-                else:
-                    # Pad with zeros (simple approach - could be improved with learned projection)
-                    padding = torch.zeros(features_normalized.shape[0], 
-                                         prototypes.shape[1] - features_normalized.shape[1],
-                                         device=features_normalized.device,
-                                         dtype=features_normalized.dtype)
-                    features_normalized = torch.cat([features_normalized, padding], dim=1)
-            
-            # Compute cosine similarity
-            sim = features_normalized @ prototypes_normalized.T
-            similarities[variant] = sim
-        
+            if per_encoder:
+                if variant not in prototypes:
+                    continue
+                bank = F.normalize(prototypes[variant].to(features.device), p=2, dim=1)
+            else:
+                bank = shared.to(features.device)
+                if features_normalized.shape[1] != bank.shape[1]:
+                    if features_normalized.shape[1] > bank.shape[1]:
+                        features_normalized = features_normalized[:, : bank.shape[1]]
+                    else:
+                        pad = torch.zeros(
+                            features_normalized.shape[0],
+                            bank.shape[1] - features_normalized.shape[1],
+                            device=features_normalized.device,
+                            dtype=features_normalized.dtype,
+                        )
+                        features_normalized = torch.cat([features_normalized, pad], dim=1)
+            similarities[variant] = features_normalized @ bank.T
         return similarities
     
     def ensemble_confidence(self, similarities: dict, temperature: float = 1.0) -> Tuple[torch.Tensor, dict]:

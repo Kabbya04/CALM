@@ -16,7 +16,17 @@ def parse_args():
     parser.add_argument(
         "--keys",
         nargs="+",
-        default=["avg_acc", "bwt", "accuracy", "mean_accuracy"],
+        default=[
+            "avg_acc",
+            "last_task_mean",
+            "bwt",
+            "accuracy",
+            "mean_accuracy",
+            "autonomous_accuracy",
+            "heldout_accuracy_after_stream",
+            "labels_used",
+            "labels_per_query",
+        ],
         help="Numeric fields to summarize when present.",
     )
     return parser.parse_args()

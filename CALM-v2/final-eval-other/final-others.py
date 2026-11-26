@@ -24,6 +24,7 @@ Example:
 import argparse
 import os
 import ssl
+import sys
 from typing import List
 
 import numpy as np
@@ -153,13 +154,64 @@ def sample_episode(dataset, class_to_indices, n_way: int, k_shot: int, num_query
 
 def embed_images(images, ensemble_models, device: str, batch_size: int, variant: str):
     features = []
-    with torch.no_grad():
+    with torch.inference_mode():
         for start in range(0, len(images), batch_size):
             batch = images[start : start + batch_size]
             features.append(
                 ensemble_models.get_image_features(batch, variant=variant)
             )
     return torch.cat(features, dim=0) if features else torch.empty((0, 512), device=device)
+
+
+def embed_all_variants(images, ensemble_models, device: str, batch_size: int):
+    """Return list of {variant: 1-d tensor} aligned with images (CPU)."""
+    variants = list(ensemble_models.models.keys())
+    banks = {name: [] for name in variants}
+    with torch.inference_mode():
+        for start in range(0, len(images), batch_size):
+            batch = images[start : start + batch_size]
+            all_features = ensemble_models.get_image_features(batch)
+            for name, feats in all_features.items():
+                banks[name].append(feats.detach().cpu())
+            del all_features
+    stacked = {
+        name: torch.cat(chunks, dim=0) if chunks else torch.empty((0, 512))
+        for name, chunks in banks.items()
+    }
+    return [
+        {name: stacked[name][i] for name in variants}
+        for i in range(len(images))
+    ]
+
+
+def score_batch(memory, ensemble_models, images, device, temperature, single_backbone, first_variant):
+    """Return predicted class-id tensor for a batch of PIL images."""
+    if single_backbone:
+        prototypes, class_ids = memory.get_prototypes(variant=first_variant)
+        if prototypes.nelement() == 0:
+            return torch.empty(0, dtype=torch.long, device=device), []
+        prototypes = F.normalize(prototypes.to(device), p=2, dim=1)
+        features = F.normalize(
+            embed_images(images, ensemble_models, device, max(1, len(images)), first_variant),
+            p=2,
+            dim=1,
+        )
+        probs = F.softmax((features @ prototypes.T) / temperature, dim=1)
+    else:
+        banks, class_ids = memory.get_prototypes_by_variant()
+        if not class_ids:
+            return torch.empty(0, dtype=torch.long, device=device), []
+        all_features = ensemble_models.get_image_features(images)
+        similarities = ensemble_models.compute_prototype_similarities(
+            all_features, banks, class_ids
+        )
+        probs, _ = ensemble_models.ensemble_confidence(
+            similarities, temperature=temperature
+        )
+        del all_features
+    pred_idx = torch.argmax(probs, dim=1)
+    predicted = torch.tensor([class_ids[i] for i in pred_idx], device=device)
+    return predicted, class_ids
 
 
 def evaluate_few_shot_episode(
@@ -176,61 +228,37 @@ def evaluate_few_shot_episode(
 
     support_images = [item[0] for item in support]
     support_labels = [item[1] for item in support]
-    support_features = embed_images(
-        support_images, ensemble_models, device, batch_size, first_variant
-    )
-
-    for embedding, label in zip(support_features, support_labels):
-        memory.add_example(embedding, label, importance=1.0, task_id=None)
-
-    prototypes, class_ids = memory.get_prototypes()
-    if prototypes.nelement() == 0:
-        return 0.0
-    prototypes = F.normalize(prototypes.to(device), p=2, dim=1)
+    if single_backbone:
+        support_features = embed_images(
+            support_images, ensemble_models, device, batch_size, first_variant
+        )
+        for embedding, label in zip(support_features, support_labels):
+            memory.add_example(embedding.cpu(), label, importance=1.0, task_id=None)
+    else:
+        payloads = embed_all_variants(support_images, ensemble_models, device, batch_size)
+        for payload, label in zip(payloads, support_labels):
+            memory.add_example(payload, label, importance=1.0, task_id=None)
 
     query_images = [item[0] for item in query]
     query_labels = torch.tensor([item[1] for item in query], device=device)
     correct = 0
 
-    with torch.no_grad():
+    with torch.inference_mode():
         for start in range(0, len(query_images), batch_size):
             batch = query_images[start : start + batch_size]
-            if single_backbone:
-                features = embed_images(
-                    batch, ensemble_models, device, batch_size, first_variant
-                )
-                features = F.normalize(features.to(device), p=2, dim=1)
-                logits = features @ prototypes.T
-            else:
-                all_features = ensemble_models.get_image_features(batch)
-                similarities = ensemble_models.compute_prototype_similarities(
-                    all_features, prototypes, class_ids
-                )
-                ensemble_probs, _ = ensemble_models.ensemble_confidence(
-                    similarities, temperature=temperature
-                )
-                predictions = torch.argmax(ensemble_probs, dim=1)
-                predicted_labels = torch.tensor(
-                    [class_ids[index] for index in predictions], device=device
-                )
-                correct += int(
-                    (
-                        predicted_labels
-                        == query_labels[start : start + len(batch)]
-                    ).sum().item()
-                )
-                continue
-
-            logits = logits / temperature
-            predictions = torch.argmax(logits, dim=1)
-            predicted_labels = torch.tensor(
-                [class_ids[index] for index in predictions], device=device
+            predicted, class_ids = score_batch(
+                memory,
+                ensemble_models,
+                batch,
+                device,
+                temperature,
+                single_backbone,
+                first_variant,
             )
+            if not class_ids:
+                continue
             correct += int(
-                (
-                    predicted_labels
-                    == query_labels[start : start + len(batch)]
-                ).sum().item()
+                (predicted == query_labels[start : start + len(batch)]).sum().item()
             )
 
     return (correct / len(query_labels)) * 100.0 if len(query_labels) else 0.0
@@ -247,39 +275,27 @@ def evaluate_indices(
     temperature: float,
     single_backbone: bool,
 ):
-    prototypes, class_ids = memory.get_prototypes()
-    if prototypes.nelement() == 0 or not indices:
+    if not indices:
         return 0.0
-    prototypes = F.normalize(prototypes.to(device), p=2, dim=1)
 
     correct, total = 0, 0
-    with torch.no_grad():
+    with torch.inference_mode():
         for start in range(0, len(indices), batch_size):
             batch_indices = indices[start : start + batch_size]
             images, labels = zip(*(get_image(dataset, int(index)) for index in batch_indices))
-
-            if single_backbone:
-                features = embed_images(
-                    list(images), ensemble_models, device, batch_size, first_variant
-                )
-                features = F.normalize(features.to(device), p=2, dim=1)
-                logits = features @ prototypes.T
-                logits = logits / temperature
-            else:
-                all_features = ensemble_models.get_image_features(list(images))
-                similarities = ensemble_models.compute_prototype_similarities(
-                    all_features, prototypes, class_ids
-                )
-                logits, _ = ensemble_models.ensemble_confidence(
-                    similarities, temperature=temperature
-                )
-
-            predictions = torch.argmax(logits, dim=1)
-            predicted_labels = torch.tensor(
-                [class_ids[index] for index in predictions], device=device
+            predicted, class_ids = score_batch(
+                memory,
+                ensemble_models,
+                list(images),
+                device,
+                temperature,
+                single_backbone,
+                first_variant,
             )
+            if not class_ids:
+                continue
             label_tensor = torch.tensor(labels, device=device)
-            correct += int((predicted_labels == label_tensor).sum().item())
+            correct += int((predicted == label_tensor).sum().item())
             total += len(labels)
 
     return (correct / total) * 100.0 if total else 0.0
@@ -326,16 +342,24 @@ def run_continual(
         for class_id in tqdm(task_classes, desc="Adding support examples"):
             indices = class_to_indices[class_id]
             selected = np.random.choice(indices, min(k_shot, len(indices)), replace=False)
+            images = []
+            labels = []
             for index in selected:
                 image, label = get_image(dataset, int(index))
-                embedding = embed_images(
-                    [image], ensemble_models, device, 1, first_variant
-                ).squeeze(0)
-                memory.add_example(
-                    embedding, label, importance=1.0, task_id=task_id
-                )
-                if args is not None and args.age_mode == "per_example":
-                    memory.increment_episode()
+                images.append(image)
+                labels.append(label)
+            if single_backbone:
+                feats = embed_images(images, ensemble_models, device, batch_size, first_variant)
+                for emb, label in zip(feats, labels):
+                    memory.add_example(emb.cpu(), label, importance=1.0, task_id=task_id)
+                    if args is not None and args.age_mode == "per_example":
+                        memory.increment_episode()
+            else:
+                payloads = embed_all_variants(images, ensemble_models, device, batch_size)
+                for payload, label in zip(payloads, labels):
+                    memory.add_example(payload, label, importance=1.0, task_id=task_id)
+                    if args is not None and args.age_mode == "per_example":
+                        memory.increment_episode()
             if args is not None and args.age_mode == "per_class":
                 memory.increment_episode()
 
@@ -368,10 +392,11 @@ def run_continual(
             )
 
     avg_accuracy = float(np.diag(results).mean())
+    last_task_mean = float(results[-1].mean())
     bwt = float(
         np.mean(results[-1, :-1] - np.diag(results)[:-1]) if num_tasks > 1 else 0.0
     )
-    return avg_accuracy, bwt, memory.memory_stats()
+    return avg_accuracy, bwt, memory.memory_stats(), last_task_mean
 
 
 def main():
@@ -453,7 +478,7 @@ def main():
         warmup.save_codecs(codec_path)
         args._codec_path = codec_path
 
-    avg_accuracy, bwt, memory_stats = run_continual(
+    avg_accuracy, bwt, memory_stats, last_task_mean = run_continual(
         dataset,
         ensemble_models,
         device,
@@ -465,27 +490,31 @@ def main():
         args,
     )
     print(f"Average Accuracy (%): {avg_accuracy:.2f}")
+    print(f"Last-task mean (%): {last_task_mean:.2f}")
     print(f"Backward Transfer (BWT): {bwt:.2f}")
     if args.output_json:
-        import json
+        calm_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+        if calm_root not in sys.path:
+            sys.path.insert(0, calm_root)
+        from atomic_json import atomic_write_json
 
-        os.makedirs(os.path.dirname(os.path.abspath(args.output_json)) or ".", exist_ok=True)
-        with open(args.output_json, "w", encoding="utf-8") as handle:
-            json.dump(
-                {
-                    "variant": "calm_v2_single" if args.single_backbone else "calm_v2",
-                    "dataset": args.datasetname,
-                    "protocol": "few_shot+continual",
-                    "seed": args.seed,
-                    "mean_accuracy": mean_accuracy,
-                    "ci95": confidence_interval,
-                    "avg_acc": avg_accuracy,
-                    "bwt": bwt,
-                    "memory": memory_stats,
-                },
-                handle,
-                indent=2,
-            )
+        atomic_write_json(
+            args.output_json,
+            {
+                "variant": (
+                    "calm_v2_single" if args.single_backbone else "calm_v2pe"
+                ),
+                "dataset": args.datasetname,
+                "protocol": "few_shot+continual",
+                "seed": args.seed,
+                "mean_accuracy": mean_accuracy,
+                "ci95": confidence_interval,
+                "avg_acc": avg_accuracy,
+                "last_task_mean": last_task_mean,
+                "bwt": bwt,
+                "memory": memory_stats,
+            },
+        )
 
 
 if __name__ == "__main__":

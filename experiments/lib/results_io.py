@@ -1,12 +1,16 @@
 import json
 import os
+import sys
 from datetime import datetime, timezone
 
+_CALM_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+if _CALM_ROOT not in sys.path:
+    sys.path.insert(0, _CALM_ROOT)
 
-DEFAULT_RESULTS_DIR = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
-    "results",
-)
+from atomic_json import atomic_write_json  # noqa: E402
+
+
+DEFAULT_RESULTS_DIR = os.path.join(_CALM_ROOT, "results")
 
 
 def write_result(payload: dict, output_json: str = None, results_dir: str = None) -> str:
@@ -22,9 +26,7 @@ def write_result(payload: dict, output_json: str = None, results_dir: str = None
         dataset = record.get("dataset", "unknown")
         seed = record.get("seed", "na")
         path = os.path.join(directory, f"{variant}_{dataset}_seed{seed}.json")
-    os.makedirs(os.path.dirname(os.path.abspath(path)) or ".", exist_ok=True)
-    with open(path, "w", encoding="utf-8") as handle:
-        json.dump(record, handle, indent=2)
+    atomic_write_json(path, record)
     print(f"Wrote results to {path}")
     return path
 

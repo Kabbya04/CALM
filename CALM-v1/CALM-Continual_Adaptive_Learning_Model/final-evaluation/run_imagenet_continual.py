@@ -27,6 +27,7 @@ from tqdm import tqdm
 import ssl
 from collections import defaultdict
 import os
+import sys
 
 from memory import EpisodicMemory
 
@@ -147,14 +148,19 @@ def run_continual_task_sequence(model, processor, data_manager, k_shot, device, 
             print(f"  Accuracy on Task {j+1} after learning Task {task_id+1}: {acc:.2f}%")
             results_matrix[task_id, j] = acc
     
-    avg_accuracy = results_matrix.diagonal().mean()
+    avg_accuracy = float(results_matrix.diagonal().mean())
+    last_task_mean = float(results_matrix[-1].mean())
     bwt = 0.0
     if num_tasks > 1:
         for j in range(num_tasks - 1):
             bwt += results_matrix[num_tasks-1, j] - results_matrix[j, j]
         bwt /= (num_tasks - 1)
         
-    return {"avg_acc": avg_accuracy, "bwt": bwt}
+    return {
+        "avg_acc": avg_accuracy,
+        "last_task_mean": last_task_mean,
+        "bwt": float(bwt),
+    }
 
 # --- 3. Main Orchestrator ---
 
@@ -223,24 +229,28 @@ def main():
     print(f"{'Number of Tasks':<25} | {args.num_tasks}")
     print(f"-"*50)
     print(f"{'Average Accuracy (%)':<25} | {results['avg_acc']:.2f}")
+    print(f"{'Last-task mean (%)':<25} | {results['last_task_mean']:.2f}")
     print(f"{'Backward Transfer (BWT)':<25} | {results['bwt']:.2f}")
     print(f"-"*50)
     print("\nBWT Definition: A value close to 0 indicates low forgetting. A large negative value indicates severe catastrophic forgetting.")
     if args.output_json:
-        os.makedirs(os.path.dirname(os.path.abspath(args.output_json)) or ".", exist_ok=True)
-        with open(args.output_json, "w", encoding="utf-8") as handle:
-            json.dump(
-                {
-                    "variant": "calm_v1",
-                    "dataset": "imagenet",
-                    "protocol": "continual",
-                    "seed": args.seed,
-                    "avg_acc": float(results["avg_acc"]),
-                    "bwt": float(results["bwt"]),
-                },
-                handle,
-                indent=2,
-            )
+        _calm_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+        if _calm_root not in sys.path:
+            sys.path.insert(0, _calm_root)
+        from atomic_json import atomic_write_json
+
+        atomic_write_json(
+            args.output_json,
+            {
+                "variant": "calm_v1",
+                "dataset": "imagenet",
+                "protocol": "continual",
+                "seed": args.seed,
+                "avg_acc": float(results["avg_acc"]),
+                "last_task_mean": float(results["last_task_mean"]),
+                "bwt": float(results["bwt"]),
+            },
+        )
 
 if __name__ == "__main__":
     main()

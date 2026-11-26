@@ -57,24 +57,13 @@ class CalibratedEnsembleModel:
         if not isinstance(images, list):
             images = [images]
         
-        # Get features from all models in ensemble
         all_features = self.ensemble_models.get_image_features(images)
-        
-        # Get prototypes from hierarchical memory
-        prototypes, class_ids = self.memory.get_prototypes()
-        if prototypes.nelement() == 0:
-            # No prototypes yet, return zeros
+        banks, class_ids = self.memory.get_prototypes_by_variant()
+        if not class_ids:
             return torch.zeros(len(images), 1, device=self.device)
-        
-        prototypes = prototypes.to(self.device)
-        prototypes = F.normalize(prototypes, p=2, dim=1)
-        
-        # Create a mapping from original class_id to its index in the prototype tensor
         self.class_id_to_idx = {cid: i for i, cid in enumerate(class_ids)}
-        
-        # Compute similarities for each variant and ensemble them
         similarities = self.ensemble_models.compute_prototype_similarities(
-            all_features, prototypes, class_ids
+            all_features, banks, class_ids
         )
         
         # Get ensemble confidence (weighted average of similarities)
@@ -132,16 +121,12 @@ class CalibratedEnsembleModel:
         if not isinstance(images, list):
             images = [images]
         
-        prototypes, class_ids = self.memory.get_prototypes()
-        if prototypes.nelement() == 0:
+        banks, class_ids = self.memory.get_prototypes_by_variant()
+        if not class_ids:
             return {}
-        
-        prototypes = prototypes.to(self.device)
-        prototypes = F.normalize(prototypes, p=2, dim=1)
-        
         all_features = self.ensemble_models.get_image_features(images)
         similarities = self.ensemble_models.compute_prototype_similarities(
-            all_features, prototypes, class_ids
+            all_features, banks, class_ids
         )
         
         ensemble_probs, stats = self.ensemble_models.ensemble_confidence(

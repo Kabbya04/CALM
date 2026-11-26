@@ -16,6 +16,7 @@ Example:
 import argparse
 import os
 import ssl
+import sys
 from typing import List, Sequence, Tuple
 
 import numpy as np
@@ -296,24 +297,26 @@ def main():
     print(f"Average Accuracy (%): {avg_accuracy:.2f}")
     print(f"Backward Transfer (BWT): {bwt:.2f}")
     if args.output_json:
-        import json
+        _calm_root = os.path.abspath(
+            os.path.join(os.path.dirname(__file__), "..", "..", "..", "..")
+        )
+        if _calm_root not in sys.path:
+            sys.path.insert(0, _calm_root)
+        from atomic_json import atomic_write_json
 
-        os.makedirs(os.path.dirname(os.path.abspath(args.output_json)) or ".", exist_ok=True)
-        with open(args.output_json, "w", encoding="utf-8") as handle:
-            json.dump(
-                {
-                    "variant": "calm_v1",
-                    "dataset": args.datasetname,
-                    "protocol": "few_shot+continual",
-                    "seed": args.seed,
-                    "mean_accuracy": mean,
-                    "ci95": ci,
-                    "avg_acc": avg_accuracy,
-                    "bwt": bwt,
-                },
-                handle,
-                indent=2,
-            )
+        atomic_write_json(
+            args.output_json,
+            {
+                "variant": "calm_v1",
+                "dataset": args.datasetname,
+                "protocol": "few_shot+continual",
+                "seed": args.seed,
+                "mean_accuracy": mean,
+                "ci95": ci,
+                "avg_acc": avg_accuracy,
+                "bwt": bwt,
+            },
+        )
 
 
 if __name__ == "__main__":

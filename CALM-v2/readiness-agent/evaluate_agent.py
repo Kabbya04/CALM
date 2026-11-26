@@ -120,11 +120,13 @@ def build_memory(train_dataset, ensemble_models, device, k_shot, debug=False):
             image, label = train_dataset[idx]
             pil_image = transforms.ToPILImage()(image)
             
-            # Use first model variant for memory storage (all variants have same embedding dim)
-            first_variant = list(ensemble_models.models.keys())[0]
-            with torch.no_grad():
-                embedding = ensemble_models.get_image_features(pil_image, variant=first_variant).squeeze(0)
-                memory.add_example(embedding, label, importance=1.0)
+            with torch.inference_mode():
+                feats = ensemble_models.get_image_features([pil_image])
+                payload = {
+                    name: tensor.squeeze(0).cpu() for name, tensor in feats.items()
+                }
+                memory.add_example(payload, label, importance=1.0)
+                del feats
     
     print(f"Memory built with {len(memory)} total examples across {len(memory.get_seen_classes())} classes")
     return memory

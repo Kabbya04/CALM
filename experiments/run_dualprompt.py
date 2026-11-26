@@ -193,6 +193,7 @@ def main():
 
     metrics = continual_metrics(results)
     print(f"Average Accuracy (%): {metrics['avg_acc']:.2f}")
+    print(f"Last-task mean (%): {metrics['last_task_mean']:.2f}")
     print(f"Backward Transfer (BWT): {metrics['bwt']:.2f}")
     write_result(
         {

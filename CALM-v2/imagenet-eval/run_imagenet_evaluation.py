@@ -100,26 +100,29 @@ def build_memory_from_support(
     memory: HierarchicalEpisodicMemory,
     device: str,
     batch_size: int,
+    single_backbone: bool = False,
 ):
-    """
-    Populate hierarchical episodic memory from a support set.
-
-    For consistency with the CIFAR experiments, we:
-      - Use the first ensemble variant to generate memory embeddings.
-      - Store those embeddings in HierarchicalEpisodicMemory.
-    """
+    """Store support embeddings: one tower if single_backbone, else per-encoder dicts."""
     support_images = [item[0] for item in support_set]
     support_labels = [item[1] for item in support_set]
-
-    # Use the first available variant as the "backbone" for memory storage
     first_variant = list(ensemble_models.models.keys())[0]
 
-    with torch.no_grad():
+    with torch.inference_mode():
         for i in range(0, len(support_images), batch_size):
             batch = support_images[i : i + batch_size]
-            features = ensemble_models.get_image_features(batch, variant=first_variant)
-            for j, embedding in enumerate(features):
-                memory.add_example(embedding, support_labels[i + j], importance=1.0, task_id=None)
+            labels = support_labels[i : i + len(batch)]
+            if single_backbone:
+                features = ensemble_models.get_image_features(batch, variant=first_variant)
+                for embedding, label in zip(features, labels):
+                    memory.add_example(embedding.cpu(), label, importance=1.0, task_id=None)
+            else:
+                all_features = ensemble_models.get_image_features(batch)
+                for j, label in enumerate(labels):
+                    payload = {
+                        name: tensor[j].cpu() for name, tensor in all_features.items()
+                    }
+                    memory.add_example(payload, label, importance=1.0, task_id=None)
+                del all_features
 
 
 def evaluate_episode(
@@ -132,36 +135,35 @@ def evaluate_episode(
     single_backbone: bool = False,
 ) -> float:
     """
-    Run a single N-way K-shot ImageNet episode with CALM-v2 components.
+    One N-way K-shot ImageNet episode.
 
-    - Builds hierarchical episodic memory from support examples (using first ensemble variant).
-    - Uses ensemble similarities and softmax to classify query examples.
-    - Returns classification accuracy (%) on the query set.
+    Ensemble mode stores and scores per-encoder prototype banks, then fuses scores.
     """
     memory = HierarchicalEpisodicMemory(device=device)
+    build_memory_from_support(
+        support_set, ensemble_models, memory, device, batch_size, single_backbone
+    )
 
-    # 1) Build memory from support
-    build_memory_from_support(support_set, ensemble_models, memory, device, batch_size)
+    first_variant = list(ensemble_models.models.keys())[0]
+    if single_backbone:
+        prototypes, class_ids = memory.get_prototypes(variant=first_variant)
+        if prototypes.nelement() == 0:
+            return 0.0
+        prototypes = F.normalize(prototypes.to(device), p=2, dim=1)
+        banks = None
+    else:
+        banks, class_ids = memory.get_prototypes_by_variant()
+        if not class_ids:
+            return 0.0
+        prototypes = None
 
-    # 2) Prepare prototypes
-    prototypes, class_ids = memory.get_prototypes()
-    if prototypes.nelement() == 0:
-        return 0.0
-
-    prototypes = prototypes.to(device)
-    prototypes = F.normalize(prototypes, p=2, dim=1)
-
-    # 3) Evaluate on query set using ensemble similarities
     query_images = [item[0] for item in query_set]
     query_labels = torch.tensor([item[1] for item in query_set], device=device)
-
     correct_predictions = 0
 
-    with torch.no_grad():
+    with torch.inference_mode():
         for i in range(0, len(query_images), batch_size):
             batch = query_images[i : i + batch_size]
-
-            first_variant = list(ensemble_models.models.keys())[0]
             if single_backbone:
                 features = F.normalize(
                     ensemble_models.get_image_features(batch, variant=first_variant),
@@ -172,15 +174,15 @@ def evaluate_episode(
             else:
                 all_features = ensemble_models.get_image_features(batch)
                 similarities = ensemble_models.compute_prototype_similarities(
-                    all_features, prototypes, class_ids
+                    all_features, banks, class_ids
                 )
                 ensemble_probs, _ = ensemble_models.ensemble_confidence(
                     similarities, temperature=temperature
                 )
+                del all_features
 
             pred_indices = torch.argmax(ensemble_probs, dim=1)
             predicted_class_ids = torch.tensor([class_ids[p] for p in pred_indices], device=device)
-
             batch_labels = query_labels[i : i + len(batch)]
             correct_predictions += (predicted_class_ids == batch_labels).sum().item()
 
@@ -246,20 +248,24 @@ def main():
     print(f"95% Confidence Interval: +/- {confidence_interval:.2f}%")
     print("-" * 60)
     if args.output_json:
-        os.makedirs(os.path.dirname(os.path.abspath(args.output_json)) or ".", exist_ok=True)
-        with open(args.output_json, "w", encoding="utf-8") as handle:
-            json.dump(
-                {
-                    "variant": "calm_v2_single" if args.single_backbone else "calm_v2",
-                    "dataset": "imagenet",
-                    "protocol": "few_shot",
-                    "seed": args.seed,
-                    "mean_accuracy": mean_accuracy,
-                    "ci95": float(confidence_interval),
-                },
-                handle,
-                indent=2,
-            )
+        calm_root = os.path.dirname(CALM_V2_ROOT)
+        if calm_root not in sys.path:
+            sys.path.insert(0, calm_root)
+        from atomic_json import atomic_write_json
+
+        atomic_write_json(
+            args.output_json,
+            {
+                "variant": (
+                    "calm_v2_single" if args.single_backbone else "calm_v2pe"
+                ),
+                "dataset": "imagenet",
+                "protocol": "few_shot",
+                "seed": args.seed,
+                "mean_accuracy": mean_accuracy,
+                "ci95": float(confidence_interval),
+            },
+        )
 
 
 if __name__ == "__main__":

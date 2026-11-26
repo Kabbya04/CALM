@@ -116,56 +116,67 @@ class HierarchicalEpisodicMemory:
         else:
             return 'old'
     
-    def _compress_embedding(self, embedding: torch.Tensor, tier: str) -> torch.Tensor:
-        """Compress embedding based on tier."""
-        if tier == 'recent':
-            return embedding  # No compression
-        elif tier in self.compression_networks:
+    @staticmethod
+    def _to_cpu_payload(embedding):
+        """Detach and move a tensor or per-variant dict to CPU for storage."""
+        if isinstance(embedding, dict):
+            return {
+                str(name): tensor.detach().float().cpu()
+                for name, tensor in embedding.items()
+            }
+        return embedding.detach().float().cpu()
+
+    def _compress_embedding(self, embedding, tier: str):
+        """Compress a tensor or per-variant dict based on tier."""
+        if isinstance(embedding, dict):
+            return {
+                name: self._compress_embedding(tensor, tier)
+                for name, tensor in embedding.items()
+            }
+        if tier == 'recent' or self.flat_memory:
+            return embedding
+        if tier in self.compression_networks:
             network = self.compression_networks[tier]
             network.eval()
-            # Ensure embedding is on correct device
             embedding = embedding.to(self.device)
             with torch.no_grad():
                 compressed = network.encode(embedding.unsqueeze(0))
-            return compressed.squeeze(0).cpu()  # Return to CPU for storage
-        else:
-            return embedding
-    
-    def _decompress_embedding(self, compressed: torch.Tensor, tier: str) -> torch.Tensor:
-        """Decompress embedding based on tier."""
-        if tier == 'recent':
-            return compressed  # No compression
-        elif tier in self.compression_networks:
+            return compressed.squeeze(0).cpu()
+        return embedding
+
+    def _decompress_embedding(self, compressed, tier: str):
+        """Decompress a tensor or per-variant dict based on tier."""
+        if isinstance(compressed, dict):
+            return {
+                name: self._decompress_embedding(tensor, tier)
+                for name, tensor in compressed.items()
+            }
+        if tier == 'recent' or self.flat_memory:
+            return compressed
+        if tier in self.compression_networks:
             network = self.compression_networks[tier]
             network.eval()
-            # Ensure compressed is on correct device
             compressed = compressed.to(self.device)
             with torch.no_grad():
                 decompressed = network.decode(compressed.unsqueeze(0))
             return decompressed.squeeze(0)
-        else:
-            return compressed
-    
-    def add_example(self, embedding: torch.Tensor, label: int, importance: float = 1.0, 
-                   task_id: Optional[int] = None):
+        return compressed
+
+    def add_example(self, embedding, label: int, importance: float = 1.0,
+                    task_id: Optional[int] = None):
         """
-        Add example to memory with appropriate compression.
-        
+        Add one labeled example.
+
         Args:
-            embedding: Full 512-dim CLIP embedding
+            embedding: A single 512-d CLIP tensor, or a dict
+                ``{variant_name: tensor}`` for per-encoder banks (B/32 + B/16).
             label: Class label
-            importance: Importance score (for compression decisions)
-            task_id: Optional task identifier
+            importance: Importance weight
+            task_id: Optional task id
         """
-        # Ensure embedding is on CPU and detached
-        embedding = embedding.detach().cpu()
-        
+        embedding = self._to_cpu_payload(embedding)
         tier = 'recent'
-        
-        # Compress if needed
         compressed = self._compress_embedding(embedding, tier)
-        
-        # Store with timestamp and importance
         timestamp = self.current_episode
         self.memory_tiers[tier][label].append((compressed, timestamp, importance, task_id))
         self.enforce_budget()
@@ -206,43 +217,46 @@ class HierarchicalEpisodicMemory:
                     for item in migrated:
                         self.memory_tiers[target_tier][class_id].append(item)
     
+    def _weighted_mean(self, items):
+        """items: list of (tensor_or_dict, importance)."""
+        if not items:
+            return None
+        sample = items[0][0]
+        weights = torch.tensor(
+            [w for _, w in items], dtype=torch.float32, device=self.device
+        )
+        if weights.sum() > 0:
+            weights = weights / weights.sum()
+        else:
+            weights = torch.ones_like(weights) / len(weights)
+
+        if isinstance(sample, dict):
+            out = {}
+            for name in sample.keys():
+                stacked = torch.stack([pair[0][name].to(self.device) for pair in items])
+                out[name] = (stacked * weights.unsqueeze(1)).sum(dim=0).cpu()
+            return out
+
+        stacked = torch.stack([pair[0].to(self.device) for pair in items])
+        return (stacked * weights.unsqueeze(1)).sum(dim=0).cpu()
+
     def _consolidate_old_memory(self):
-        """Consolidate very old examples into prototypes."""
+        """Consolidate very old examples into a single weighted code per class."""
         for class_id in list(self.memory_tiers['old'].keys()):
             examples = self.memory_tiers['old'][class_id]
-            
-            if len(examples) > 5:  # Only consolidate if enough examples
-                # Decompress all embeddings
-                decompressed = []
-                for emb, timestamp, importance, task_id in examples:
-                    decompressed_emb = self._decompress_embedding(emb, 'old').to(self.device)
-                    decompressed.append((decompressed_emb, importance))
-                
-                # Compute weighted prototype
-                embeddings = torch.stack([e for e, _ in decompressed])
-                weights = torch.tensor(
-                    [w for _, w in decompressed], dtype=torch.float32, device=self.device
-                )
-                if weights.sum() > 0:
-                    weights = weights / weights.sum()  # Normalize
-                else:
-                    weights = torch.ones_like(weights) / len(weights)
-                
-                prototype = (embeddings * weights.unsqueeze(1)).sum(dim=0)
-                
-                # Store prototype (compressed)
-                prototype_compressed = self._compress_embedding(prototype, 'old')
-                
-                # Replace examples with prototype
-                # Store task_id from first example
-                task_id = examples[0][3] if examples[0][3] is not None else None
-                self.memory_tiers['old'][class_id] = [
-                    (prototype_compressed, self.current_episode, 1.0, task_id)
-                ]
-                
-                # Also store in prototype dict
-                if task_id is not None:
-                    self.prototypes[task_id][class_id] = prototype_compressed
+            if len(examples) <= 5:
+                continue
+            decompressed = []
+            for emb, timestamp, importance, task_id in examples:
+                decompressed.append((self._decompress_embedding(emb, 'old'), importance))
+            prototype = self._weighted_mean(decompressed)
+            prototype_compressed = self._compress_embedding(prototype, 'old')
+            task_id = examples[0][3] if examples[0][3] is not None else None
+            self.memory_tiers['old'][class_id] = [
+                (prototype_compressed, self.current_episode, 1.0, task_id)
+            ]
+            if task_id is not None:
+                self.prototypes[task_id][class_id] = prototype_compressed
     
     def increment_episode(self, steps=1):
         """Advance the age clock and migrate examples that crossed a tier."""
@@ -257,17 +271,36 @@ class HierarchicalEpisodicMemory:
     def _tier_dim(self, tier: str) -> int:
         return int(self.compression_ratios.get(tier, (512, 1))[0])
 
+    def _payload_floats(self, payload, tier: str) -> int:
+        """Number of float32 values stored for one example payload."""
+        dim = self._tier_dim(tier)
+        if isinstance(payload, dict):
+            return len(payload) * dim
+        return dim
+
     def tier_counts(self) -> dict:
         counts = {}
         for tier, by_class in self.memory_tiers.items():
             counts[tier] = sum(len(examples) for examples in by_class.values())
         return counts
 
+    def encoder_names(self) -> List[str]:
+        """Return sorted encoder keys if multi-encoder storage is in use."""
+        for tier in self.memory_tiers.values():
+            for examples in tier.values():
+                if examples:
+                    payload = examples[0][0]
+                    if isinstance(payload, dict):
+                        return sorted(payload.keys())
+                    return []
+        return []
+
     def stored_bytes(self, include_codecs: bool = False) -> int:
         total = 0
         for tier, by_class in self.memory_tiers.items():
-            n = sum(len(examples) for examples in by_class.values())
-            total += n * self._tier_dim(tier) * 4
+            for examples in by_class.values():
+                for payload, *_ in examples:
+                    total += self._payload_floats(payload, tier) * 4
         if include_codecs:
             for network in self.compression_networks.values():
                 total += sum(int(p.numel()) * 4 for p in network.parameters())
@@ -296,6 +329,8 @@ class HierarchicalEpisodicMemory:
             "flat_memory": self.flat_memory,
             "tau_recent": self.tau_recent,
             "tau_medium": self.tau_medium,
+            "encoder_names": self.encoder_names(),
+            "per_encoder": bool(self.encoder_names()),
         }
 
     def enforce_budget(self):
@@ -329,56 +364,92 @@ class HierarchicalEpisodicMemory:
                 self.compression_networks[name].load_state_dict(state)
                 self.compression_networks[name].eval()
     
-    def get_prototypes(self) -> Tuple[torch.Tensor, List[int]]:
+    def _collect_class_examples(self, class_id: int):
+        all_examples = []
+        for tier in ['recent', 'medium', 'old']:
+            if class_id not in self.memory_tiers[tier]:
+                continue
+            for emb, timestamp, importance, task_id in self.memory_tiers[tier][class_id]:
+                all_examples.append((self._decompress_embedding(emb, tier), importance))
+        return all_examples
+
+    def get_prototypes_by_variant(self) -> Tuple[dict, List[int]]:
         """
-        Get prototypes for all classes, decompressing as needed.
-        
+        Per-encoder class means.
+
         Returns:
-            prototypes: Tensor of shape [num_classes, 512]
-            class_ids: List of class labels
+            prototypes: {variant: Tensor[num_classes, dim]} on self.device
+            class_ids: shared class order
         """
         all_class_ids = set()
         for tier in self.memory_tiers.values():
             all_class_ids.update(tier.keys())
-        
+        if not all_class_ids:
+            return {}, []
+
+        class_ids = sorted(all_class_ids)
+        names = self.encoder_names()
+        if not names:
+            # Single-tensor storage: expose as one anonymous bank.
+            bank, ids = self.get_prototypes(variant=None)
+            return {"__single__": bank}, ids
+
+        banks = {name: [] for name in names}
+        kept_ids = []
+        for class_id in class_ids:
+            examples = self._collect_class_examples(class_id)
+            if not examples:
+                continue
+            mean = self._weighted_mean(examples)
+            kept_ids.append(class_id)
+            for name in names:
+                banks[name].append(mean[name].to(self.device))
+
+        if not kept_ids:
+            return {}, []
+        return {
+            name: torch.stack(tensors)
+            for name, tensors in banks.items()
+        }, kept_ids
+
+    def get_prototypes(self, variant: Optional[str] = None) -> Tuple[torch.Tensor, List[int]]:
+        """
+        Class-mean prototypes.
+
+        - Multi-encoder memory + variant set: that encoder's bank.
+        - Multi-encoder memory + variant None: first encoder bank (legacy callers);
+          prefer get_prototypes_by_variant() for ensemble scoring.
+        - Single-tensor memory: the only bank.
+        """
+        names = self.encoder_names()
+        if names:
+            banks, class_ids = self.get_prototypes_by_variant()
+            if not class_ids:
+                return torch.empty(0), []
+            key = variant if variant in banks else names[0]
+            return banks[key], class_ids
+
+        all_class_ids = set()
+        for tier in self.memory_tiers.values():
+            all_class_ids.update(tier.keys())
         if not all_class_ids:
             return torch.empty(0), []
-        
+
         class_ids = sorted(all_class_ids)
         prototypes = []
-        
+        kept_ids = []
         for class_id in class_ids:
-            # Collect examples from all tiers
-            all_examples = []
-            for tier in ['recent', 'medium', 'old']:
-                if class_id in self.memory_tiers[tier]:
-                    for emb, timestamp, importance, task_id in self.memory_tiers[tier][class_id]:
-                        # Decompress if needed
-                        decompressed = self._decompress_embedding(emb, tier).to(self.device)
-                        all_examples.append((decompressed, importance))
-            
-            if not all_examples:
+            examples = self._collect_class_examples(class_id)
+            if not examples:
                 continue
-            
-            # Compute weighted prototype
-            embeddings = torch.stack([e for e, _ in all_examples])
-            weights = torch.tensor(
-                [w for _, w in all_examples], dtype=torch.float32, device=self.device
-            )
-            if weights.sum() > 0:
-                weights = weights / weights.sum()  # Normalize
-            else:
-                weights = torch.ones_like(weights) / len(weights)
-            
-            prototype = (embeddings * weights.unsqueeze(1)).sum(dim=0)
-            prototypes.append(prototype)
-        
+            mean = self._weighted_mean(examples)
+            prototypes.append(mean.to(self.device))
+            kept_ids.append(class_id)
+
         if not prototypes:
             return torch.empty(0), []
-        
-        prototypes_tensor = torch.stack(prototypes)
-        return prototypes_tensor, class_ids
-    
+        return torch.stack(prototypes), kept_ids
+
     def get_seen_classes(self) -> List[int]:
         """Returns list of unique class labels seen so far."""
         all_classes = set()

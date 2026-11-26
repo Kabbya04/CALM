@@ -206,13 +206,13 @@ def run_continual_task_sequence(ensemble_models, data_manager, k_shot, device,
             for idx in support_indices:
                 image, label = train_subset[idx]
                 pil_image = transforms.ToPILImage()(image)
-                
-                # Get embedding from first model (for memory storage)
-                first_variant = list(ensemble_models.models.keys())[0]
-                with torch.no_grad():
-                    embedding = ensemble_models.get_image_features(pil_image, variant=first_variant).squeeze()
-                
-                memory.add_example(embedding, label, importance=1.0, task_id=task_id)
+                with torch.inference_mode():
+                    feats = ensemble_models.get_image_features([pil_image])
+                    payload = {
+                        name: tensor.squeeze(0).cpu() for name, tensor in feats.items()
+                    }
+                memory.add_example(payload, label, importance=1.0, task_id=task_id)
+                del feats
         
         # Increment episode after adding examples
         memory.increment_episode()
@@ -263,33 +263,25 @@ def evaluate_on_memory_ensemble(memory, ensemble_models, test_loader, device,
     for model in ensemble_models.models.values():
         model.eval()
     
-    prototypes, class_ids = memory.get_prototypes()
-    if prototypes.nelement() == 0:
+    banks, class_ids = memory.get_prototypes_by_variant()
+    if not class_ids:
         return 0.0, {}
-    
-    prototypes = prototypes.to(device)
-    prototypes = F.normalize(prototypes, p=2, dim=1)
-    
+
     correct = 0
     total = 0
     tier_counts = {'high': 0, 'medium_autonomous': 0, 'medium_uncertain': 0, 'low': 0}
     human_feedback = 0
     
-    with torch.no_grad():
+    with torch.inference_mode():
         for images, labels in test_loader:
             pil_images = [transforms.ToPILImage()(img) for img in images]
-            
-            # Get features from all models
             all_features = ensemble_models.get_image_features(pil_images)
-            
-            # Compute similarities for each variant
             similarities = ensemble_models.compute_prototype_similarities(
-                all_features, prototypes, class_ids
+                all_features, banks, class_ids
             )
             
-            # Calibrate confidence with ensemble
             results = ensemble_models.calibrate_confidence(
-                similarities, prototypes, class_ids, temperature,
+                similarities, banks, class_ids, temperature,
                 delta_low, delta_high
             )
             

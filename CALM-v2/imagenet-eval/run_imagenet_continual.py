@@ -109,26 +109,29 @@ def evaluate_on_memory_ensemble(
       - prototypes from hierarchical memory
       - ensemble CLIP similarity for classification
     """
-    prototypes, class_ids = memory.get_prototypes()
-    if prototypes.nelement() == 0:
-        return 0.0
-
-    prototypes = prototypes.to(device)
-    prototypes = F.normalize(prototypes, p=2, dim=1)
+    first_variant = list(ensemble_models.models.keys())[0]
+    if single_backbone:
+        prototypes, class_ids = memory.get_prototypes(variant=first_variant)
+        if prototypes.nelement() == 0:
+            return 0.0
+        prototypes = F.normalize(prototypes.to(device), p=2, dim=1)
+        banks = None
+    else:
+        banks, class_ids = memory.get_prototypes_by_variant()
+        if not class_ids:
+            return 0.0
+        prototypes = None
 
     test_loader = DataLoader(data_manager.get_task_datasets(task_id), batch_size=batch_size, shuffle=False)
 
     correct = 0
     total = 0
 
-    with torch.no_grad():
+    with torch.inference_mode():
         for images, labels in test_loader:
             labels = labels.to(device)
-
-            # Convert batch of tensors back to PIL images for CLIP processors
             pil_images = [transforms.ToPILImage()(img) for img in images]
 
-            first_variant = list(ensemble_models.models.keys())[0]
             if single_backbone:
                 features = F.normalize(
                     ensemble_models.get_image_features(pil_images, variant=first_variant),
@@ -139,11 +142,12 @@ def evaluate_on_memory_ensemble(
             else:
                 all_features = ensemble_models.get_image_features(pil_images)
                 similarities = ensemble_models.compute_prototype_similarities(
-                    all_features, prototypes, class_ids
+                    all_features, banks, class_ids
                 )
                 ensemble_probs, _ = ensemble_models.ensemble_confidence(
                     similarities, temperature=temperature
                 )
+                del all_features
 
             pred_indices = torch.argmax(ensemble_probs, dim=1)
             predicted_class_ids = torch.tensor([class_ids[i] for i in pred_indices], device=device)
@@ -204,15 +208,24 @@ def run_continual_task_sequence(
 
             support_indices = np.random.choice(class_subset_indices, k_sample, replace=False)
 
+            use_single = bool(args.single_backbone) if args is not None else False
             for idx in support_indices:
                 image_tensor, label = data_manager.dataset[idx]
                 image_pil = transforms.ToPILImage()(image_tensor)
 
-                with torch.no_grad():
-                    features = ensemble_models.get_image_features([image_pil], variant=first_variant)
-                    embedding = features.squeeze(0)
-
-                memory.add_example(embedding, int(label), importance=1.0, task_id=task_id)
+                with torch.inference_mode():
+                    if use_single:
+                        embedding = ensemble_models.get_image_features(
+                            [image_pil], variant=first_variant
+                        ).squeeze(0).cpu()
+                        memory.add_example(embedding, int(label), importance=1.0, task_id=task_id)
+                    else:
+                        feats = ensemble_models.get_image_features([image_pil])
+                        payload = {
+                            name: tensor.squeeze(0).cpu() for name, tensor in feats.items()
+                        }
+                        memory.add_example(payload, int(label), importance=1.0, task_id=task_id)
+                        del feats
                 if args is not None and args.age_mode == "per_example":
                     memory.increment_episode()
             if args is not None and args.age_mode == "per_class":
@@ -238,17 +251,20 @@ def run_continual_task_sequence(
             print(f"  Accuracy on Task {j + 1} after learning Task {task_id + 1}: {acc:.2f}%")
             results_matrix[task_id, j] = acc
 
-    # Average accuracy: mean of diagonal (performance on each task right after learning it)
     avg_accuracy = float(results_matrix.diagonal().mean())
-
-    # Backward transfer (BWT): average over tasks of final performance minus performance right after learning
+    last_task_mean = float(results_matrix[-1].mean())
     bwt = 0.0
     if num_tasks > 1:
         for j in range(num_tasks - 1):
             bwt += results_matrix[num_tasks - 1, j] - results_matrix[j, j]
         bwt /= (num_tasks - 1)
 
-    return {"avg_acc": avg_accuracy, "bwt": float(bwt), "memory": memory.memory_stats()}
+    return {
+        "avg_acc": avg_accuracy,
+        "last_task_mean": last_task_mean,
+        "bwt": float(bwt),
+        "memory": memory.memory_stats(),
+    }
 
 
 def parse_args():
@@ -375,6 +391,7 @@ def main():
     print(f"{'Number of Tasks':<30} | {args.num_tasks}")
     print("-" * 55)
     print(f"{'Average Accuracy (%)':<30} | {results['avg_acc']:.2f}")
+    print(f"{'Last-task mean (%)':<30} | {results['last_task_mean']:.2f}")
     print(f"{'Backward Transfer (BWT)':<30} | {results['bwt']:.2f}")
     print("-" * 55)
     print(
@@ -384,23 +401,28 @@ def main():
     if args.log_memory:
         print(f"Final memory: {results.get('memory')}")
     if args.output_json:
-        os.makedirs(os.path.dirname(os.path.abspath(args.output_json)) or ".", exist_ok=True)
-        with open(args.output_json, "w", encoding="utf-8") as handle:
-            json.dump(
-                {
-                    "variant": "calm_v2_single" if args.single_backbone else "calm_v2",
-                    "dataset": "imagenet",
-                    "protocol": "continual",
-                    "seed": args.seed,
-                    "age_mode": args.age_mode,
-                    "flat_memory": args.flat_memory,
-                    "avg_acc": results["avg_acc"],
-                    "bwt": results["bwt"],
-                    "memory": results.get("memory"),
-                },
-                handle,
-                indent=2,
-            )
+        calm_root = os.path.dirname(CALM_V2_ROOT)
+        if calm_root not in sys.path:
+            sys.path.insert(0, calm_root)
+        from atomic_json import atomic_write_json
+
+        atomic_write_json(
+            args.output_json,
+            {
+                "variant": (
+                    "calm_v2_single" if args.single_backbone else "calm_v2pe"
+                ),
+                "dataset": "imagenet",
+                "protocol": "continual",
+                "seed": args.seed,
+                "age_mode": args.age_mode,
+                "flat_memory": args.flat_memory,
+                "avg_acc": results["avg_acc"],
+                "last_task_mean": results["last_task_mean"],
+                "bwt": results["bwt"],
+                "memory": results.get("memory"),
+            },
+        )
 
 
 if __name__ == "__main__":

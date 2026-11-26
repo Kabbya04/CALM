@@ -96,7 +96,7 @@ def targets_of(dataset):
     raise AttributeError("dataset has no labels")
 
 
-def build_memory(dataset, embed_fn, k_shot, device):
+def build_memory(dataset, embed_fn, k_shot, device, ensemble=None):
     targets = targets_of(dataset)
     class_ids = sorted(int(x) for x in np.unique(targets))
     memory = HierarchicalEpisodicMemory(device=device) if embed_fn.kind == "v2" else FlatMemory()
@@ -111,12 +111,16 @@ def build_memory(dataset, embed_fn, k_shot, device):
             images.append(image)
             labels.append(label)
             used.add(int(idx))
-        feats = embed_fn(images)
-        for emb, label in zip(feats, labels):
-            if embed_fn.kind == "v2":
-                memory.add_example(emb, label, importance=1.0)
-            else:
-                memory.add_example(emb, label)
+        if embed_fn.kind == "v2":
+            all_features = ensemble.get_image_features(images)
+            for j, label in enumerate(labels):
+                payload = {name: tensor[j].cpu() for name, tensor in all_features.items()}
+                memory.add_example(payload, label, importance=1.0)
+            del all_features
+        else:
+            feats = embed_fn(images)
+            for emb, label in zip(feats, labels):
+                memory.add_example(emb.cpu(), label)
     return memory, used
 
 
@@ -131,10 +135,12 @@ def scores_for(memory, images, embed_fn, ensemble, temperature):
         pred = torch.tensor([class_ids[i] for i in pred_idx], device=feats.device)
         return pred, conf, None
 
-    prototypes, class_ids = memory.get_prototypes()
-    prototypes = F.normalize(prototypes.to(embed_fn.device), p=2, dim=1)
+    banks, class_ids = memory.get_prototypes_by_variant()
+    if not class_ids:
+        empty = torch.empty(0, dtype=torch.long, device=embed_fn.device)
+        return empty, empty.float(), None
     all_features = ensemble.get_image_features(images)
-    similarities = ensemble.compute_prototype_similarities(all_features, prototypes, class_ids)
+    similarities = ensemble.compute_prototype_similarities(all_features, banks, class_ids)
     probs, stats = ensemble.ensemble_confidence(similarities, temperature=temperature)
     conf, pred_idx = probs.max(dim=1)
     pred = torch.tensor([class_ids[i] for i in pred_idx], device=embed_fn.device)
@@ -189,7 +195,7 @@ def main():
         embed_fn.kind = "v2"
         embed_fn.device = device
 
-    memory, used = build_memory(dataset, embed_fn, args.k_shot, device)
+    memory, used = build_memory(dataset, embed_fn, args.k_shot, device, ensemble=ensemble)
     query_idx = [i for i in range(len(dataset)) if i not in used]
     preds, confs, labels, agrees = [], [], [], []
     for start in range(0, len(query_idx), args.batch_size):
@@ -221,9 +227,12 @@ def main():
             f"rho={row['rho']:.2f}  coverage={row['coverage']:.3f}  "
             f"deferral={row['deferral_rate']:.3f}  deployed_err={row['deployed_error']:.3f}"
         )
+    variant_name = (
+        "readiness_v2pe" if args.variant == "v2" else f"readiness_{args.variant}"
+    )
     write_result(
         {
-            "variant": f"readiness_{args.variant}",
+            "variant": variant_name,
             "dataset": args.dataset,
             "protocol": "readiness",
             "seed": args.seed,

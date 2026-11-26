@@ -88,7 +88,12 @@ def sample_supports(manager: ImageNetContinualManager, class_id: int, k_shot: in
 def continual_metrics(results_matrix: np.ndarray) -> dict:
     num_tasks = results_matrix.shape[0]
     avg_acc = float(results_matrix.diagonal().mean())
+    last_task_mean = float(results_matrix[-1].mean()) if num_tasks else 0.0
     bwt = 0.0
     if num_tasks > 1:
         bwt = float(np.mean(results_matrix[-1, :-1] - np.diag(results_matrix)[:-1]))
-    return {"avg_acc": avg_acc, "bwt": bwt}
+    return {
+        "avg_acc": avg_acc,
+        "last_task_mean": last_task_mean,
+        "bwt": bwt,
+    }

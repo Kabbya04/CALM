@@ -10,6 +10,7 @@ import numpy as np
 import argparse
 import json
 import os
+import sys
 from tqdm import tqdm
 import ssl
 
@@ -140,20 +141,22 @@ def main():
     print(f"95% Confidence Interval: +/- {confidence_interval:.2f}%")
     print("-" * 50)
     if args.output_json:
-        os.makedirs(os.path.dirname(os.path.abspath(args.output_json)) or ".", exist_ok=True)
-        with open(args.output_json, "w", encoding="utf-8") as handle:
-            json.dump(
-                {
-                    "variant": "calm_v1",
-                    "dataset": "imagenet",
-                    "protocol": "few_shot",
-                    "seed": args.seed,
-                    "mean_accuracy": float(mean_accuracy),
-                    "ci95": float(confidence_interval),
-                },
-                handle,
-                indent=2,
-            )
+        _calm_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+        if _calm_root not in sys.path:
+            sys.path.insert(0, _calm_root)
+        from atomic_json import atomic_write_json
+
+        atomic_write_json(
+            args.output_json,
+            {
+                "variant": "calm_v1",
+                "dataset": "imagenet",
+                "protocol": "few_shot",
+                "seed": args.seed,
+                "mean_accuracy": float(mean_accuracy),
+                "ci95": float(confidence_interval),
+            },
+        )
 
 if __name__ == "__main__":
     main()
